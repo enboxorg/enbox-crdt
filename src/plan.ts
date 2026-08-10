@@ -73,10 +73,25 @@ export function shouldSnapshot<TDoc>(
   state: SnapshotState,
   policy: SnapshotPolicy = DEFAULT_SNAPSHOT_POLICY,
 ): boolean {
-  if (distinctCount(state.distinctDeltasSinceSnapshot) > policy.maxDeltasSinceSnapshot) return true;
-  const mergedBytes = engine.encodeFullState(doc).byteLength;
+  return snapshotDecision(engine, doc, state, policy).snapshot;
+}
+
+/**
+ * The {@link shouldSnapshot} decision plus the full state it may have encoded
+ * to make it, so {@link planFlush} never encodes the document twice.
+ */
+function snapshotDecision<TDoc>(
+  engine: MergeEngine<TDoc>,
+  doc: TDoc,
+  state: SnapshotState,
+  policy: SnapshotPolicy,
+): { snapshot: boolean; fullState?: Uint8Array } {
+  if (distinctCount(state.distinctDeltasSinceSnapshot) > policy.maxDeltasSinceSnapshot) {
+    return { snapshot: true };
+  }
+  const fullState = engine.encodeFullState(doc);
   const byteThreshold = Math.max(policy.byteGrowthFactor * state.lastSnapshotBytes, policy.byteGrowthFloor);
-  return mergedBytes > byteThreshold;
+  return { snapshot: fullState.byteLength > byteThreshold, fullState };
 }
 
 /**
@@ -93,8 +108,12 @@ export function planFlush<TDoc>(
   state: FlushState,
   policy: SnapshotPolicy = DEFAULT_SNAPSHOT_POLICY,
 ): FlushPlan {
-  if (state.canSnapshot !== false && shouldSnapshot(engine, doc, state, policy)) {
-    return { kind: 'snapshot', delta: encodeEnvelope(engine.formatId, engine.encodeFullState(doc)) };
+  if (state.canSnapshot !== false) {
+    const decision = snapshotDecision(engine, doc, state, policy);
+    if (decision.snapshot) {
+      const fullState = decision.fullState ?? engine.encodeFullState(doc);
+      return { kind: 'snapshot', delta: encodeEnvelope(engine.formatId, fullState) };
+    }
   }
   const residual = engine.encodeDiff(doc, state.lastFlushedStateVector);
   if (residual === null) return { kind: 'noop' };

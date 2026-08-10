@@ -88,6 +88,11 @@ Rules:
   Because Yjs re-emits the full delete set in every diff, emptiness MUST be
   judged content-aware (e.g. `Y.parseUpdateMeta(update).to` empty ⇔ no new
   structs), never by payload byte length.
+- **Position anchors (informative):** applications exchanging cursor/selection
+  positions for `yjs1` documents use the Yjs **relative-position v1**
+  encoding (`Y.encodeRelativePosition`), which the independent
+  implementations also support. Anchor payloads are application data
+  (presence), not deltas, and are out of this spec's normative scope.
 
 ### 3.2 Reserved ids
 

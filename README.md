@@ -1,12 +1,18 @@
 # @enbox/crdt
 
-Format-tagged, cross-language-safe CRDT sync for Enbox dapps.
+Format-tagged, cross-language-safe CRDT sync for Enbox dapps — behind an API
+where **your application never imports or thinks about Yjs**.
 
 Enbox dapps keep collaborative state as end-to-end encrypted, append-only
 delta records — relays and storage never see plaintext, so **clients own the
-merge**. This package standardizes the part of that stack that must be
-identical across every client, in every language:
+merge**. This package standardizes the parts of that stack that must be
+identical across every client, in every language, and wraps them in one
+document handle:
 
+- **`CollabDoc`** — the application-facing document: text editing, change
+  events, undo, stable position anchors, durable/live delta application,
+  flush planning, and realtime healing. The underlying CRDT library is an
+  implementation detail you never touch.
 - **the delta envelope** — a 10-byte, language-trivial header
   (`EBXD` + version + format id) so a document is never anonymous bytes and
   readers that don't implement its format **fail closed** instead of
@@ -15,17 +21,12 @@ identical across every client, in every language:
   13.6-era wire (yjs 14 changes it), because it is the only CRDT format with
   independent implementations in Rust (yrs, y-octo), Go (ygo), and JS —
   which is what makes a future Rust/CLI Enbox client realistic **today**;
-- **the sync math** proven in notesd — pure flush planning
-  (incremental vs snapshot), the re-publish invariant for squash races, DWN
-  write classification, and state-vector reconciliation for lossy realtime
-  channels;
+- **the sync bookkeeping proven in notesd** — the live-document/durable-shadow
+  model, snapshot (squash) races, the re-publish invariant, and state-vector
+  reconciliation for lossy realtime channels;
 - **conformance fixtures** — deterministic JSON vectors under
   [`fixtures/`](./fixtures) that a second-language implementation tests
   against.
-
-What it deliberately does **not** do: wrap or hide Yjs. Your app keeps using
-`Y.Doc`, editor bindings, `Y.UndoManager`, and persistence directly — this
-package only fixes the wire.
 
 ## Install
 
@@ -33,71 +34,99 @@ package only fixes the wire.
 npm install @enbox/crdt yjs
 ```
 
-`yjs` is a peer dependency (`>=13.6 <14`), needed only for the
-`@enbox/crdt/yjs1` engine.
+`yjs` is a peer dependency of the `@enbox/crdt/yjs1` engine only. It is an
+implementation detail: **no application code imports it** (the package's own
+lifecycle test suite is written entirely without a `yjs` import).
 
 ## Usage
 
-### Writing deltas (the flush path)
+### A document, start to finish
 
 ```ts
-import { planFlush } from '@enbox/crdt';
-import { yjs1 } from '@enbox/crdt/yjs1';
+import { createYjs1Doc } from '@enbox/crdt/yjs1';
 
-const plan = planFlush(yjs1, doc, {
-  lastFlushedStateVector,          // engine SV at the last acknowledged write
-  distinctDeltasSinceSnapshot,     // count or Set of delta record ids
-  lastSnapshotBytes,
-  canSnapshot: role !== 'editor',  // squash authority
+const doc = createYjs1Doc();          // CollabDoc, format 'yjs1'
+
+// --- editing ---------------------------------------------------------------
+doc.insertText(0, 'Hello world');
+doc.replaceText(0, 5, 'Goodbye');
+doc.onTextChange(({ edits, source }) => {
+  // sequential splices + provenance: 'local' | 'durable' | 'live'
+  render(edits, source);
 });
+doc.undo();
+doc.redo();
 
-if (plan.kind !== 'noop') {
-  await records.create({
-    data: plan.delta,              // envelope-tagged bytes
-    squash: plan.kind === 'snapshot',
+// --- hydration and durable events ------------------------------------------
+for (const record of await queryDeltas()) {
+  doc.applyDurable(await record.bytes(), {
+    recordId: record.id,
+    snapshot: record.squash === true,
+    messageTimestamp: record.messageTimestamp,
   });
 }
-```
 
-### Reading deltas (hydration and events)
-
-```ts
-import { applyEnvelope } from '@enbox/crdt';
-import { yjs1 } from '@enbox/crdt/yjs1';
-
-const outcome = applyEnvelope(yjs1, doc, record.bytes, REMOTE_ORIGIN);
-if (!outcome.applied) {
-  // fail closed: 'format-mismatch' → read-only surface;
-  // 'not-an-envelope' → legacy migration path, if your dapp has one
+// --- flushing local changes ------------------------------------------------
+const plan = doc.planFlush({ canSnapshot: role !== 'editor' });
+if (plan.kind !== 'noop') {
+  const { record, status } = await writeDelta(plan.delta, {
+    squash: plan.kind === 'snapshot',
+  });
+  if (ok(status)) doc.commitFlush(plan, { recordId: record.id, messageTimestamp: record.messageTimestamp });
 }
 ```
 
 ### Squash races and backstop rejections
 
 ```ts
-import { classifyWriteResult, computeRepublish, squashFloorTimestamp } from '@enbox/crdt/enbox';
+import { classifyWriteResult, squashFloorTimestamp } from '@enbox/crdt/enbox';
 
 switch (classifyWriteResult(status)) {
   case 'backstop': {
-    const republish = computeRepublish(yjs1, doc, squasherStateVector, {
-      afterSquashTs: squashFloorTimestamp(status),
-    });
+    // storage compacted underneath us — publish exactly what it lacks,
+    // stamped strictly past the squash floor
+    const republish = doc.planRepublish({ afterSquashTs: squashFloorTimestamp(status) });
     if (republish) await writeFresh(republish.delta, republish.messageTimestamp);
     break;
   }
-  case 'parent-gone': teardown(); break;   // terminal — never re-publish
+  case 'parent-gone': doc.destroy(); break;  // terminal — never re-publish
+  // 'error': transient — keep editing; a later planFlush() carries the residual
 }
 ```
 
-### Realtime healing over a lossy channel
+A foreign snapshot arriving by subscription is the same story:
+`doc.applyDurable(bytes, { snapshot: true, messageTimestamp })` replaces the
+durable shadow, and `doc.planRepublish()` returns whatever the squasher
+omitted (or `null`). Local work can never be destroyed by someone else's
+compaction.
+
+### Realtime (lossy channel as an accelerator)
 
 ```ts
-import { wireLiveSync } from '@enbox/crdt/live';
-
-const off = wireLiveSync(yjs1, channel, () => openDoc, () => isCurrent);
-// probes on connect + every 3s; replies to behind peers with exactly the
-// missing diff; deletion-bearing docs never spray no-op heals.
+doc.onLocalUpdate((frame) => channel.broadcastUpdate(frame)); // outbound
+channel.onUpdate((frame) => doc.applyLive(frame));            // inbound
+doc.connectLiveSync(channel);   // SV probes + exact-diff heals; drops self-heal
 ```
+
+Durable records stay the source of truth; realtime only makes it feel
+instant. A dropped frame heals within one probe interval.
+
+### Cursors and selections
+
+```ts
+const anchor = doc.anchorAt(selectionStart);   // Uint8Array — safe to ship to peers
+// …concurrent edits happen…
+const index = doc.indexOfAnchor(anchor);       // still points at the same character
+```
+
+## Where is Yjs in all this?
+
+Behind `@enbox/crdt/yjs1`, as an implementation detail of the `yjs1` format —
+the same way a JSON parser is an implementation detail of HTTP. The one
+deliberate escape hatch is `doc.unwrap()` (typed as `unwrapYDoc(doc)`), which
+exists for native editor bindings (e.g. y-codemirror) until first-class editor
+adapters ship. If you don't bind such an editor, there is no reason to ever
+see a Yjs type.
 
 ## Cross-language story
 
@@ -107,19 +136,21 @@ payload already has independent implementations — a Rust client uses
 [ygo](https://github.com/Deln0r/ygo). Conformance means passing
 [`fixtures/`](./fixtures) (see [SPEC.md §6](./SPEC.md)): envelope cases
 byte-for-byte, and `yjs1` scenarios converging under any application order.
+Position anchors use the Yjs relative-position v1 encoding, so cursors
+interoperate too.
 
-Adding a future format (`loro1`, `automerge1`, …) is a new
-`MergeEngine` + a registry entry in the spec — per-document, no protocol
-redesign, because every payload already declares its format.
+Adding a future format (`loro1`, `automerge1`, …) means implementing the
+`DocEngine` interface and registering the id in the spec — per-document, no
+protocol redesign, because every payload already declares its format.
 
 ## Package layout
 
 | Export | Contents |
 | --- | --- |
-| `@enbox/crdt` | envelope encode/decode, `MergeEngine` seam, `applyEnvelope`, flush planning |
-| `@enbox/crdt/yjs1` | the pinned baseline engine (peer dep: yjs 13.6.x) |
+| `@enbox/crdt` | `CollabDoc`/`createCollabDoc`, envelope encode/decode, `MergeEngine`/`DocEngine` seams, `applyEnvelope`, flush planning |
+| `@enbox/crdt/yjs1` | `createYjs1Doc` — the one import most apps need; the pinned baseline engine (peer dep: yjs 13.6.x); `unwrapYDoc` escape hatch |
 | `@enbox/crdt/enbox` | DWN write classification, squash-backstop timestamp math, `computeRepublish` |
-| `@enbox/crdt/live` | transport-agnostic state-vector reconciliation (`wireLiveSync`) |
+| `@enbox/crdt/live` | transport-agnostic state-vector reconciliation (`wireLiveSync`) for custom lifecycles |
 
 ## Development
 
@@ -133,9 +164,10 @@ bun run build
 
 ## Roadmap
 
-- flush-loop state machine (doc + durable-shadow bookkeeping) lifted from
-  notesd once its API settles here;
-- awareness/presence profile for the live channel;
+- editor adapter packages (`@enbox/crdt-codemirror` first) so even editor
+  bindings need no `unwrap()`;
+- awareness/presence profile for the live channel (anchors already cover
+  cursor positions);
 - `enbox-crdt-rs`: Rust conformance consumer over yrs, validating the same
   fixtures;
 - eslint config aligned with the enbox monorepo.

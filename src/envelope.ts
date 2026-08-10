@@ -23,8 +23,11 @@
 
 import { concatBytes } from './bytes.js';
 
-/** The 4-byte envelope magic: ASCII "EBXD" (Enbox Delta). */
-export const ENVELOPE_MAGIC: Uint8Array = Uint8Array.from([0x45, 0x42, 0x58, 0x44]);
+/** The magic bytes, kept private so no consumer mutation can corrupt framing. */
+const MAGIC = [0x45, 0x42, 0x58, 0x44] as const;
+
+/** The 4-byte envelope magic: ASCII "EBXD" (Enbox Delta). Returned as a copy. */
+export const ENVELOPE_MAGIC: Uint8Array = Uint8Array.from(MAGIC);
 
 /** The envelope version this module reads and writes. */
 export const ENVELOPE_VERSION = 1;
@@ -36,7 +39,7 @@ export const MAX_FORMAT_ID_LENGTH = 32;
 export const FORMAT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /** Envelope header size for a given format-id length. */
-const HEADER_BASE = ENVELOPE_MAGIC.byteLength + 2; // magic + version + id length
+const HEADER_BASE = MAGIC.length + 2; // magic + version + id length
 
 /** A decoded envelope. `payload` is a subarray view into the input bytes. */
 export interface Envelope {
@@ -82,7 +85,7 @@ export function encodeEnvelope(format: string, payload: Uint8Array): Uint8Array 
   }
   const id = ASCII_ENCODER.encode(format);
   const header = new Uint8Array(HEADER_BASE);
-  header.set(ENVELOPE_MAGIC, 0);
+  header.set(MAGIC, 0);
   header[4] = ENVELOPE_VERSION;
   header[5] = id.byteLength;
   return concatBytes(header, id, payload);
@@ -90,9 +93,9 @@ export function encodeEnvelope(format: string, payload: Uint8Array): Uint8Array 
 
 /** Whether the bytes begin with the envelope magic. Cheap sniff for migration paths. */
 export function isEnvelope(bytes: Uint8Array): boolean {
-  if (bytes.byteLength < ENVELOPE_MAGIC.byteLength) return false;
-  for (let i = 0; i < ENVELOPE_MAGIC.byteLength; i++) {
-    if (bytes[i] !== ENVELOPE_MAGIC[i]) return false;
+  if (bytes.byteLength < MAGIC.length) return false;
+  for (let i = 0; i < MAGIC.length; i++) {
+    if (bytes[i] !== MAGIC[i]) return false;
   }
   return true;
 }

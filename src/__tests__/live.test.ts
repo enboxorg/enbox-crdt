@@ -147,18 +147,25 @@ describe('wireLiveSync', () => {
     doc.destroy();
   });
 
-  it("stops the probe loop on 'closed' status", () => {
+  it("pauses probing on 'closed' and resumes — probe plus interval — on reconnect", () => {
     const fake = fakeChannel();
     const doc = docWith('hello');
-    wireLiveSync(yjs1, fake.channel, () => doc, () => true, { intervalMs: 1000 });
+    const off = wireLiveSync(yjs1, fake.channel, () => doc, () => true, { intervalMs: 1000 });
     expect(fake.syncFrames.length).toBe(1);
 
     fake.emitStatus('closed');
     vi.advanceTimersByTime(5000);
     expect(fake.syncFrames.length).toBe(1);
 
-    fake.emitStatus('connected'); // reconnect probes immediately even with the timer stopped
+    fake.emitStatus('connected'); // immediate reconcile…
     expect(fake.syncFrames.length).toBe(2);
+    vi.advanceTimersByTime(2000); // …and the periodic probe is running again
+    expect(fake.syncFrames.length).toBe(4);
+
+    off();
+    fake.emitStatus('connected'); // a torn-down loop must not resurrect
+    vi.advanceTimersByTime(5000);
+    expect(fake.syncFrames.length).toBe(4);
     doc.destroy();
   });
 });

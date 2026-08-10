@@ -25,7 +25,17 @@ export {
 export type { Envelope, EnvelopeErrorCode } from './envelope.js';
 
 export { applyEnvelope } from './engine.js';
-export type { MergeEngine, ApplyEnvelopeResult } from './engine.js';
+export type { MergeEngine, DocEngine, ApplyEnvelopeResult, TextEdit, UndoHandle } from './engine.js';
+
+export { CollabDoc, createCollabDoc } from './collab-doc.js';
+export type {
+  CollabDocOptions,
+  DurableDeltaMeta,
+  FlushAckMeta,
+  PlanFlushOptions,
+  TextChange,
+  TextChangeSource,
+} from './collab-doc.js';
 
 export {
   DEFAULT_SNAPSHOT_POLICY,

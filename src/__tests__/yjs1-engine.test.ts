@@ -179,7 +179,48 @@ describe('yjs1 engine', () => {
     const invalid = applyEnvelope(yjs1, doc, encodeEnvelope('yjs1', Uint8Array.from([250, 250, 250])));
     expect(invalid).toEqual({ applied: false, reason: 'invalid-payload', format: 'yjs1' });
 
+    const futureVersion = encodeEnvelope('yjs1', update).slice();
+    futureVersion[4] = 2;
+    expect(applyEnvelope(yjs1, doc, futureVersion)).toEqual({
+      applied: false,
+      reason: 'corrupt-envelope',
+      envelopeError: 'unsupported-version',
+    });
+
     source.destroy();
+    yjs1.destroyDoc?.(doc);
+  });
+
+  it('exposes the document tier: splice, observe, undo origins, anchors', () => {
+    const doc = yjs1.createDoc();
+
+    // observeText converts engine deltas into sequential splices.
+    const batches: Array<{ edits: unknown; origin: unknown }> = [];
+    const off = yjs1.observeText(doc, (edits, origin) => batches.push({ edits, origin }));
+    yjs1.spliceText(doc, 0, 0, 'hello', 'me');
+    yjs1.spliceText(doc, 2, 2, 'XY', 'me'); // replace 'll' with 'XY'
+    expect(yjs1.getText(doc)).toBe('heXYo');
+    expect(batches[0]).toEqual({ edits: [{ index: 0, deleteCount: 0, insert: 'hello' }], origin: 'me' });
+    expect(batches[1]?.edits).toEqual([
+      { index: 2, deleteCount: 2, insert: '' },
+      { index: 2, deleteCount: 0, insert: 'XY' },
+    ]);
+    off();
+
+    // Undo tracks only the named origins.
+    const undo = yjs1.createUndo(doc, ['tracked']);
+    yjs1.spliceText(doc, 0, 0, 'A-', 'tracked');
+    yjs1.spliceText(doc, 0, 0, 'B-', 'untracked');
+    expect(yjs1.getText(doc)).toBe('B-A-heXYo');
+    undo.undo();
+    expect(yjs1.getText(doc)).toBe('B-heXYo'); // only the tracked edit reverted
+    expect(undo.canRedo()).toBe(true);
+    undo.destroy();
+
+    // Anchors survive edits before them.
+    const anchor = yjs1.anchorAt(doc, 2, 0); // at 'h'
+    yjs1.spliceText(doc, 0, 0, '>>', 'me');
+    expect(yjs1.indexOfAnchor(doc, anchor)).toBe(4);
     yjs1.destroyDoc?.(doc);
   });
 });

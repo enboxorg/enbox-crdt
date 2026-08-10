@@ -97,10 +97,15 @@ export function wireLiveSync<TDoc>(
   });
 
   let timer: ReturnType<typeof setInterval> | undefined;
+  let stopped = false;
   const offStatus = channel.onStatus?.((status) => {
-    // A reconnect can leave us behind by whatever was missed while the socket
-    // was down — reconcile the moment we're back, not a tick later.
-    if (status === 'connected') probe();
+    if (status === 'connected' && !stopped) {
+      // A reconnect can leave us behind by whatever was missed while the
+      // socket was down — reconcile the moment we're back, not a tick later,
+      // and resume the periodic probe if 'closed' had paused it.
+      probe();
+      timer ??= setInterval(probe, intervalMs);
+    }
     if (status === 'closed' && timer !== undefined) {
       clearInterval(timer);
       timer = undefined;
@@ -111,7 +116,11 @@ export function wireLiveSync<TDoc>(
   timer = setInterval(probe, intervalMs);
 
   return () => {
-    if (timer !== undefined) clearInterval(timer);
+    stopped = true;
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
     offSync();
     offStatus?.();
   };
