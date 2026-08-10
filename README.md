@@ -162,6 +162,15 @@ bun run fixtures    # regenerate fixtures (deterministic)
 bun run build
 ```
 
+### Releases
+
+Same [changesets](https://github.com/changesets/changesets) flow as the enbox
+monorepo: run `bunx --bun changeset` alongside your change and commit the
+generated file (`--bun` forces the Bun runtime — the changesets CLI needs
+`require(esm)`, which Node 21 lacks; Node 20.19+/22.12+ also work). On push to
+`main`, the Release workflow opens (or updates) a "chore: version packages"
+PR; merging that PR publishes to npm and tags the release.
+
 ## Roadmap
 
 - editor adapter packages (`@enbox/crdt-codemirror` first) so even editor

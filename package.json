@@ -1,6 +1,6 @@
 {
   "name": "@enbox/crdt",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Format-tagged, cross-language-safe CRDT sync layer for Enbox dapps — pinned yjs1 delta format, merge-engine seam, flush planning, and conformance fixtures",
   "type": "module",
   "main": "./dist/index.js",
@@ -35,7 +35,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "fixtures": "bun scripts/generate-fixtures.ts"
+    "fixtures": "bun scripts/generate-fixtures.ts",
+    "prepublishOnly": "bun run build",
+    "changeset": "changeset",
+    "version": "changeset version && bun install",
+    "release": "bun run build && changeset publish"
   },
   "homepage": "https://github.com/enboxorg/enbox-crdt#readme",
   "bugs": "https://github.com/enboxorg/enbox-crdt/issues",
@@ -62,6 +66,8 @@
     }
   },
   "devDependencies": {
+    "@changesets/changelog-github": "0.5.2",
+    "@changesets/cli": "2.29.8",
     "@types/node": "20.19.33",
     "typescript": "5.9.3",
     "vitest": "3.2.6",
