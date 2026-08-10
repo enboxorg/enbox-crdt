@@ -1,0 +1,82 @@
+{
+  "name": "@enbox/crdt",
+  "version": "0.1.0",
+  "description": "Format-tagged, cross-language-safe CRDT sync layer for Enbox dapps — pinned yjs1 delta format, merge-engine seam, flush planning, and conformance fixtures",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./yjs1": {
+      "types": "./dist/yjs1/index.d.ts",
+      "import": "./dist/yjs1/index.js"
+    },
+    "./enbox": {
+      "types": "./dist/enbox/index.d.ts",
+      "import": "./dist/enbox/index.js"
+    },
+    "./live": {
+      "types": "./dist/live/index.d.ts",
+      "import": "./dist/live/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "fixtures",
+    "SPEC.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fixtures": "bun scripts/generate-fixtures.ts"
+  },
+  "homepage": "https://github.com/enboxorg/enbox-crdt#readme",
+  "bugs": "https://github.com/enboxorg/enbox-crdt/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/enboxorg/enbox-crdt.git"
+  },
+  "license": "Apache-2.0",
+  "contributors": [
+    {
+      "name": "Liran Cohen",
+      "url": "https://github.com/LiranCohen"
+    }
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "yjs": ">=13.6.0 <14"
+  },
+  "peerDependenciesMeta": {
+    "yjs": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "20.19.33",
+    "typescript": "5.9.3",
+    "vitest": "3.2.6",
+    "yjs": "13.6.31"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "crdt",
+    "yjs",
+    "enbox",
+    "dwn",
+    "local-first",
+    "e2ee",
+    "sync"
+  ]
+}

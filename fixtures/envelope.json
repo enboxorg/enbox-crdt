@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "valid: yjs1 with empty-update payload",
+      "bytes": "RUJYRAEEeWpzMQAA",
+      "expect": {
+        "format": "yjs1",
+        "payload": "AAA="
+      }
+    },
+    {
+      "name": "valid: single-char format id, empty payload",
+      "bytes": "RUJYRAEBYQ==",
+      "expect": {
+        "format": "a",
+        "payload": ""
+      }
+    },
+    {
+      "name": "valid: 32-char format id",
+      "bytes": "RUJYRAEgeHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgBAgM=",
+      "expect": {
+        "format": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "payload": "AQID"
+      }
+    },
+    {
+      "name": "error: bad magic (legacy raw payload)",
+      "bytes": "AQIDBAUG",
+      "expect": {
+        "error": "not-an-envelope"
+      }
+    },
+    {
+      "name": "error: unsupported envelope version 2",
+      "bytes": "RUJYRAIEeWpzMQAA",
+      "expect": {
+        "error": "unsupported-version"
+      }
+    },
+    {
+      "name": "error: header truncated after version byte",
+      "bytes": "RUJYRAE=",
+      "expect": {
+        "error": "truncated"
+      }
+    },
+    {
+      "name": "error: format id truncated",
+      "bytes": "RUJYRAEEeWo=",
+      "expect": {
+        "error": "truncated"
+      }
+    },
+    {
+      "name": "error: zero-length format id",
+      "bytes": "RUJYRAEAeWpzMQAA",
+      "expect": {
+        "error": "invalid-format-id"
+      }
+    },
+    {
+      "name": "error: uppercase in format id",
+      "bytes": "RUJYRAEEWWpzMQAA",
+      "expect": {
+        "error": "invalid-format-id"
+      }
+    }
+  ]
+}
