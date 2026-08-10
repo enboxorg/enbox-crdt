@@ -1,0 +1,5 @@
+# Supply-chain policy: dependencies are saved with EXACT versions — never
+# ^ or ~ ranges. This makes `bun add` default to exact; the committed
+# bun.lock plus `--frozen-lockfile` in CI enforce the rest.
+[install]
+exact = true

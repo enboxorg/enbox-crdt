@@ -30,29 +30,32 @@ jobs:
       # prevention), so the version PR would never receive its CI checks. The
       # App acts as a distinct identity, so its commits/PR updates trigger
       # `ci.yml` normally. Same App and secret names as enboxorg/enbox.
+      # Actions are pinned to commit SHAs (version tags are mutable refs).
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Persist App credentials so pushes performed by the version/publish
           # scripts use the App identity, not `github-actions[bot]`.
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '20'
+          # Node 22 (active LTS): Node 20 reached EOL 2026-04, and the
+          # changesets CLI needs require(esm) (Node >= 20.19 / 22.12).
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
@@ -60,7 +63,7 @@ jobs:
 
       - name: Create Release PR or Publish
         id: changesets
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           # Single-package repo with no workspace:* protocol, so plain
           # `changeset publish` works (it publishes via npm, which reads auth
