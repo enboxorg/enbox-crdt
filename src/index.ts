@@ -32,6 +32,7 @@ export type {
   CollabDocOptions,
   DurableDeltaMeta,
   FlushAckMeta,
+  FlushCommitResult,
   PlanFlushOptions,
   TextChange,
   TextChangeSource,

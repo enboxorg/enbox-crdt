@@ -8,6 +8,7 @@ import {
   computeRepublish,
   formatDwnTimestamp,
   PARENT_GONE_ERROR_CODE,
+  PARENT_RECORD_NOT_FOUND_ERROR_CODE,
   squashFloorTimestamp,
 } from '../enbox/index.js';
 import { decodeEnvelope } from '../envelope.js';
@@ -18,6 +19,7 @@ describe('classifyWriteResult', () => {
     expect(classifyWriteResult({ code: 202 })).toBe('ok');
     expect(classifyWriteResult({ code: 409, errorCode: BACKSTOP_ERROR_CODE })).toBe('backstop');
     expect(classifyWriteResult({ code: 400, errorCode: PARENT_GONE_ERROR_CODE })).toBe('parent-gone');
+    expect(classifyWriteResult({ code: 400, errorCode: PARENT_RECORD_NOT_FOUND_ERROR_CODE })).toBe('parent-gone');
     expect(classifyWriteResult({ code: 409, errorCode: 'SomethingElse' })).toBe('error');
     expect(classifyWriteResult({ code: 400, errorCode: BACKSTOP_ERROR_CODE })).toBe('error');
     expect(classifyWriteResult({ code: 500 })).toBe('error');

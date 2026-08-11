@@ -87,7 +87,7 @@ describe('wireLiveSync', () => {
     doc.destroy();
   });
 
-  it('replies with exactly the missing diff on the heal lane', () => {
+  it('replies with a conservative diff on the heal lane', () => {
     const fake = fakeChannel();
     const doc = docWith('hello world');
     wireLiveSync(yjs1, fake.channel, () => doc, () => true, { intervalMs: 60_000 });
@@ -104,15 +104,36 @@ describe('wireLiveSync', () => {
     doc.destroy();
   });
 
-  it('stays silent for a converged peer even when the doc contains deletions', () => {
+  it('conservatively re-sends delete sets a peer state vector cannot describe', () => {
     const fake = fakeChannel();
     const doc = docWith('hello');
     doc.getText('content').delete(0, 1); // non-empty delete set
     wireLiveSync(yjs1, fake.channel, () => doc, () => true, { intervalMs: 60_000 });
 
     fake.emitSync(encodeEnvelope('yjs1', Y.encodeStateVector(doc)));
-    expect(fake.healFrames.length).toBe(0);
+    expect(fake.healFrames.length).toBe(1);
+    const { payload } = decodeEnvelope(fake.healFrames[0] as Uint8Array);
+    expect(yjs1.applyDelta(doc, payload)).toBe(false); // harmlessly idempotent
     doc.destroy();
+  });
+
+  it('heals a fully-dropped deletion-only update', () => {
+    const fake = fakeChannel();
+    const source = docWith('hello');
+    const target = new Y.Doc();
+    target.clientID = 43;
+    Y.applyUpdate(target, Y.encodeStateAsUpdate(source));
+    source.getText('content').delete(0, 1); // state vector does not advance
+
+    wireLiveSync(yjs1, fake.channel, () => source, () => true, { intervalMs: 60_000 });
+    fake.emitSync(encodeEnvelope('yjs1', Y.encodeStateVector(target)));
+
+    expect(fake.healFrames.length).toBe(1);
+    const { payload } = decodeEnvelope(fake.healFrames[0] as Uint8Array);
+    expect(yjs1.applyDelta(target, payload)).toBe(true);
+    expect(target.getText('content').toString()).toBe('ello');
+    target.destroy();
+    source.destroy();
   });
 
   it('ignores non-envelope frames, foreign formats, and garbage state vectors', () => {

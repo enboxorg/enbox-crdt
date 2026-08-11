@@ -84,10 +84,13 @@ Rules:
   attribution codecs). `yjs1` is pinned to the **13.6-era v1 encoding**;
   payloads requiring v14 semantics MUST NOT be written under the `yjs1` id.
   Adopting a later encoding is a new registry entry, not an upgrade.
-- **Emptiness:** producers SHOULD NOT emit diffs that carry no new operations.
-  Because Yjs re-emits the full delete set in every diff, emptiness MUST be
-  judged content-aware (e.g. `Y.parseUpdateMeta(update).to` empty ⇔ no new
-  structs), never by payload byte length.
+- **Emptiness:** a Yjs state vector summarizes structs but does not summarize
+  which structs have been deleted. A producer holding only a remote state
+  vector MUST therefore preserve a non-empty delete set in its diff: it cannot
+  distinguish a converged peer from one missing only that deletion. Reapplying
+  the delete set is idempotent. A producer that owns both documents MAY suppress
+  the diff after comparing their deterministic full-state encodings. An update
+  with neither structs nor delete-set entries is empty.
 - **Position anchors (informative):** applications exchanging cursor/selection
   positions for `yjs1` documents use the Yjs **relative-position v1**
   encoding (`Y.encodeRelativePosition`), which the independent
@@ -120,6 +123,10 @@ of its visible delta payloads.
 - **D5.** Readers MUST treat `advanced = false` application results
   (already-known operations, own echoes) as no-ops — no re-render storms, no
   echo re-publication.
+- **D6.** Within one implementation, encoding the same complete operation state
+  as a full-state payload MUST be deterministic. A document handle that owns
+  both its live state and durable shadow MAY use byte equality of those payloads
+  to suppress conservative diffs for summaries that omit operation classes.
 
 ## 5. Realtime reconciliation profile
 
@@ -128,11 +135,12 @@ reconciliation profile:
 
 - **R1.** Peers periodically — and immediately on (re)connect — broadcast a
   **sync probe**: an envelope whose payload is their state vector.
-- **R2.** A peer holding operations the prober lacks replies with an envelope
-  carrying exactly the missing diff, on a lane that outranks ordinary update
-  traffic.
-- **R3.** A peer MUST NOT reply to a probe that shows a converged sender —
-  including when the local document contains deletions (see §3.1 emptiness).
+- **R2.** A peer holding operations the prober may lack replies with an envelope
+  carrying the format's diff, on a lane that outranks ordinary update traffic.
+- **R3.** A peer MUST NOT reply when the remote summary proves the diff empty.
+  When the summary omits an operation class, a peer MUST reply conservatively.
+  For `yjs1`, a non-empty delete set is re-sent because a state vector cannot
+  prove whether the prober has applied it; the receiver applies it idempotently.
 - **R4.** Frames that are not envelopes, carry a foreign format id, or contain
   undecodable payloads MUST be ignored (fail closed); they MUST NOT tear down
   the session.

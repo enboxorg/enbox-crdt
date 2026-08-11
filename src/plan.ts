@@ -99,8 +99,12 @@ function snapshotDecision<TDoc>(
  * snapshot flag (e.g. DWN `squash: true`) from the plan kind.
  *
  * - snapshot when authorized and {@link shouldSnapshot} fires — full state;
- * - otherwise the incremental residual beyond `lastFlushedStateVector`;
- * - `noop` when the residual carries nothing new (no write storms).
+ * - otherwise the conservative incremental residual beyond
+ *   `lastFlushedStateVector`;
+ * - `noop` when the format's summary proves the residual empty. For formats
+ *   whose state vectors omit operation classes (yjs1 deletions), use
+ *   `CollabDoc.planFlush()` so its live/shadow full-state comparison can also
+ *   suppress an idempotent conservative residual.
  */
 export function planFlush<TDoc>(
   engine: MergeEngine<TDoc>,
@@ -121,10 +125,12 @@ export function planFlush<TDoc>(
 }
 
 /**
- * The residual local operations beyond a remote state vector, envelope-tagged,
- * or `null` when local and remote already agree. This is the re-publish
- * invariant's engine-generic core: after a snapshot/squash from another writer,
- * publish exactly what the snapshot omitted — never a verbatim retry.
+ * The conservative residual local operations beyond a remote state vector,
+ * envelope-tagged, or `null` when the format's summary proves none exist. This
+ * is the re-publish invariant's engine-generic core: after a snapshot/squash
+ * from another writer, publish what the snapshot may have omitted — never a
+ * verbatim retry. `CollabDoc.planRepublish()` additionally compares the owned
+ * live/shadow full states to suppress conservative no-op residuals.
  */
 export function encodeResidual<TDoc>(
   engine: MergeEngine<TDoc>,
