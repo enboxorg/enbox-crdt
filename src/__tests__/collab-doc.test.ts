@@ -4,7 +4,7 @@
  * guarantee consuming applications get.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { encodeEnvelope } from '../index.js';
 import type { TextChange } from '../index.js';
@@ -455,5 +455,36 @@ describe('CollabDoc — lifecycle', () => {
     expect(() => doc.getText()).toThrow(/destroyed/);
     expect(() => doc.insertText(0, 'x')).toThrow(/destroyed/);
     expect(() => doc.planFlush()).toThrow(/destroyed/);
+  });
+
+  it('makes subscription teardowns idempotent before and after destroy', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const doc = createYjs1Doc();
+      const offText = doc.onTextChange(() => undefined);
+      const offUpdate = doc.onLocalUpdate(() => undefined);
+      let syncUnsubscribeCount = 0;
+      const offSync = doc.connectLiveSync({
+        broadcastSync: () => undefined,
+        broadcastHeal: () => undefined,
+        onSync: () => () => {
+          syncUnsubscribeCount++;
+        },
+      }, { intervalMs: 60_000 });
+
+      offText();
+      offText();
+      doc.destroy();
+      offText();
+      offUpdate();
+      offUpdate();
+      offSync();
+      offSync();
+
+      expect(syncUnsubscribeCount).toBe(1);
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

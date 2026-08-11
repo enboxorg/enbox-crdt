@@ -129,6 +129,19 @@ export class CollabDoc<TDoc = unknown> {
     if (this.destroyed) throw new Error('CollabDoc has been destroyed');
   }
 
+  /** Register a teardown shared by explicit unsubscribe and document destroy. */
+  private registerTeardown(teardown: () => void): () => void {
+    let active = true;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      this.teardowns.delete(release);
+      teardown();
+    };
+    this.teardowns.add(release);
+    return release;
+  }
+
   // -------------------------------------------------------------------------
   // Text
   // -------------------------------------------------------------------------
@@ -168,11 +181,7 @@ export class CollabDoc<TDoc = unknown> {
     const off = this.engine.observeText(this.live, (edits, origin) => {
       listener({ edits, source: this.classify(origin) });
     });
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   private classify(origin: unknown): TextChangeSource {
@@ -300,11 +309,7 @@ export class CollabDoc<TDoc = unknown> {
       if (origin === this.DURABLE || origin === this.LIVE) return;
       listener(encodeEnvelope(this.engine.formatId, payload));
     });
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   // -------------------------------------------------------------------------
@@ -449,11 +454,7 @@ export class CollabDoc<TDoc = unknown> {
       () => !this.destroyed,
       options,
     );
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   // -------------------------------------------------------------------------
