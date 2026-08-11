@@ -1,6 +1,6 @@
 {
   "name": "@enbox/crdt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Format-tagged, cross-language-safe CRDT sync layer for Enbox dapps — pinned yjs1 delta format, merge-engine seam, flush planning, and conformance fixtures",
   "type": "module",
   "main": "./dist/index.js",

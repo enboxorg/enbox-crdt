@@ -1,5 +1,11 @@
 # @enbox/crdt
 
+## 0.1.1
+
+### Patch Changes
+
+- [#2](https://github.com/enboxorg/enbox-crdt/pull/2) [`7e228d5`](https://github.com/enboxorg/enbox-crdt/commit/7e228d53f24c541f8e6d49137b44a32bd966daad) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Fix deletion-only persistence and realtime healing, fence stale snapshot acknowledgements, and expose explicit re-publish commit bookkeeping.
+
 ## 0.1.0
 
 ### Minor Changes
