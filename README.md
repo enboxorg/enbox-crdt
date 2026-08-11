@@ -72,7 +72,16 @@ if (plan.kind !== 'noop') {
   const { record, status } = await writeDelta(plan.delta, {
     squash: plan.kind === 'snapshot',
   });
-  if (ok(status)) doc.commitFlush(plan, { recordId: record.id, messageTimestamp: record.messageTimestamp });
+  if (ok(status)) {
+    const commit = doc.commitFlush(plan, {
+      recordId: record.id,
+      messageTimestamp: record.messageTimestamp,
+    });
+    if (!commit.committed && commit.reason === 'superseded') {
+      // A newer squash won while the write was in flight. The local residual
+      // remains pending and must be published past commit.squashFloorTimestamp.
+    }
+  }
 }
 ```
 
@@ -83,10 +92,21 @@ import { classifyWriteResult, squashFloorTimestamp } from '@enbox/crdt/enbox';
 
 switch (classifyWriteResult(status)) {
   case 'backstop': {
-    // storage compacted underneath us — publish exactly what it lacks,
+    // storage compacted underneath us — publish what it may lack,
     // stamped strictly past the squash floor
     const republish = doc.planRepublish({ afterSquashTs: squashFloorTimestamp(status) });
-    if (republish) await writeFresh(republish.delta, republish.messageTimestamp);
+    if (republish) {
+      const { record, status: republishStatus } = await writeFresh(
+        republish.delta,
+        republish.messageTimestamp,
+      );
+      if (ok(republishStatus)) {
+        doc.commitRepublish(republish, {
+          recordId: record.id,
+          messageTimestamp: record.messageTimestamp,
+        });
+      }
+    }
     break;
   }
   case 'parent-gone': doc.destroy(); break;  // terminal — never re-publish
@@ -105,11 +125,14 @@ compaction.
 ```ts
 doc.onLocalUpdate((frame) => channel.broadcastUpdate(frame)); // outbound
 channel.onUpdate((frame) => doc.applyLive(frame));            // inbound
-doc.connectLiveSync(channel);   // SV probes + exact-diff heals; drops self-heal
+doc.connectLiveSync(channel);   // SV probes + diff heals; drops self-heal
 ```
 
 Durable records stay the source of truth; realtime only makes it feel
-instant. A dropped frame heals within one probe interval.
+instant. A dropped frame heals within one probe interval. Because a Yjs state
+vector does not report deletions, a deletion-bearing peer conservatively
+re-sends its idempotent delete set during reconciliation; this is the bounded
+cost of healing a dropped deletion-only frame correctly.
 
 ### Cursors and selections
 

@@ -94,7 +94,7 @@ describe('yjs1 engine', () => {
     yjs1.destroyDoc?.(doc);
   });
 
-  it('encodeDiff returns null for a converged peer even when deletions exist (heal-spam guard)', () => {
+  it('encodeDiff conservatively retains delete sets a state vector cannot describe', () => {
     const doc = docWithClient(6);
     doc.getText('content').insert(0, 'hello');
     doc.getText('content').delete(0, 1); // delete set is now non-empty
@@ -102,13 +102,88 @@ describe('yjs1 engine', () => {
     // A peer that has seen everything: its SV equals ours.
     const peerSv = yjs1.encodeStateVector(doc);
 
-    // Yjs re-emits the full delete set in every diff, so the raw diff is
-    // larger than an empty update — the naive byteLength test would heal-spam.
+    // Yjs re-emits the full delete set in every diff. The engine cannot know
+    // from the peer's state vector whether that peer has seen the deletion, so
+    // it must retain the idempotent payload.
     const rawDiff = Y.encodeStateAsUpdate(doc, peerSv);
     expect(rawDiff.byteLength).toBeGreaterThan(2);
 
-    expect(yjs1.encodeDiff(doc, peerSv)).toBeNull();
+    const diff = yjs1.encodeDiff(doc, peerSv);
+    expect(diff).not.toBeNull();
+    expect(yjs1.applyDelta(doc, diff as Uint8Array)).toBe(false);
     doc.destroy();
+  });
+
+  it('reports a deletion-only delta as advancement when it changes the document', () => {
+    const source = docWithClient(6);
+    source.getText('content').insert(0, 'hello');
+    const target = yjs1.createDoc();
+    yjs1.applyDelta(target, Y.encodeStateAsUpdate(source));
+
+    let deletion: Uint8Array | undefined;
+    source.on('update', (update: Uint8Array) => {
+      deletion = update;
+    });
+    source.getText('content').delete(0, 1);
+
+    expect(deletion).toBeDefined();
+    expect(yjs1.applyDelta(target, deletion as Uint8Array)).toBe(true);
+    expect(yjs1.getText(target)).toBe('ello');
+    expect(yjs1.applyDelta(target, deletion as Uint8Array)).toBe(false);
+    source.destroy();
+    yjs1.destroyDoc?.(target);
+  });
+
+  it('reports a deletion received before its referenced insert as advancement', () => {
+    const source = docWithClient(7);
+    source.getText('content').insert(0, 'x');
+    const insertion = Y.encodeStateAsUpdate(source);
+
+    let deletion: Uint8Array | undefined;
+    source.on('update', (update: Uint8Array) => {
+      deletion = update;
+    });
+    source.getText('content').delete(0, 1);
+
+    const target = docWithClient(8);
+    expect(deletion).toBeDefined();
+    expect(yjs1.applyDelta(target, deletion as Uint8Array)).toBe(true);
+    expect(yjs1.applyDelta(target, deletion as Uint8Array)).toBe(false);
+    expect(yjs1.getText(target)).toBe('');
+
+    expect(yjs1.applyDelta(target, insertion)).toBe(true);
+    expect(yjs1.getText(target)).toBe('');
+    expect(yjs1.applyDelta(target, insertion)).toBe(false);
+    expect(yjs1.applyDelta(target, deletion as Uint8Array)).toBe(false);
+
+    source.destroy();
+    target.destroy();
+  });
+
+  it('reports a dependent struct received before its prerequisite as advancement', () => {
+    const source = docWithClient(9);
+    source.getText('content').insert(0, 'a');
+    const prerequisite = Y.encodeStateAsUpdate(source);
+
+    let dependent: Uint8Array | undefined;
+    source.on('update', (update: Uint8Array) => {
+      dependent = update;
+    });
+    source.getText('content').insert(1, 'b');
+
+    const target = docWithClient(10);
+    expect(dependent).toBeDefined();
+    expect(yjs1.applyDelta(target, dependent as Uint8Array)).toBe(true);
+    expect(yjs1.applyDelta(target, dependent as Uint8Array)).toBe(false);
+    expect(yjs1.getText(target)).toBe('');
+
+    expect(yjs1.applyDelta(target, prerequisite)).toBe(true);
+    expect(yjs1.getText(target)).toBe('ab');
+    expect(yjs1.applyDelta(target, prerequisite)).toBe(false);
+    expect(yjs1.applyDelta(target, dependent as Uint8Array)).toBe(false);
+
+    source.destroy();
+    target.destroy();
   });
 
   it('encodeDiff returns the missing operations for a behind peer', () => {

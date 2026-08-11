@@ -109,11 +109,14 @@ describe('planFlush', () => {
 });
 
 describe('encodeResidual', () => {
-  it('returns null when local and remote agree (even with deletions present)', () => {
+  it('conservatively retains delete sets when only a state vector is available', () => {
     const doc = yjs1.createDoc();
     doc.getText('content').insert(0, 'abc');
     doc.getText('content').delete(0, 1);
-    expect(encodeResidual(yjs1, doc, yjs1.encodeStateVector(doc))).toBeNull();
+    const residual = encodeResidual(yjs1, doc, yjs1.encodeStateVector(doc));
+    expect(residual).not.toBeNull();
+    const { payload } = decodeEnvelope(residual as Uint8Array);
+    expect(yjs1.applyDelta(doc, payload)).toBe(false);
     yjs1.destroyDoc?.(doc);
   });
 

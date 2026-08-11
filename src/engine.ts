@@ -41,25 +41,31 @@ export interface MergeEngine<TDoc = unknown> {
   /**
    * Apply a delta payload (NOT enveloped — see {@link applyEnvelope}).
    * Returns `true` iff the document's operation state advanced — i.e. the
-   * payload carried operations the document had not seen. Note the engine's
-   * notion of "advanced" may be blind to pure deletions (yjs1 is); callers use
-   * this for echo suppression, where that blindness is benign.
+   * payload carried operations (including deletions) the document had not seen.
    * `origin` is threaded into the engine's transaction machinery so change
    * observers can distinguish local edits from remote/live application.
    */
   applyDelta(doc: TDoc, payload: Uint8Array, origin?: unknown): boolean;
 
-  /** Encode the complete document state as one payload (snapshot / squash body). */
+  /**
+   * Encode the complete document state as one payload (snapshot / squash body).
+   * The encoding MUST be deterministic within an engine implementation:
+   * equivalent documents produce byte-equal full states. `CollabDoc` uses that
+   * property to distinguish a genuinely missing deletion from the conservative
+   * delete-set re-emission described by {@link encodeDiff}.
+   */
   encodeFullState(doc: TDoc): Uint8Array;
 
   /** Encode the document's state vector (the compact "what I have" summary). */
   encodeStateVector(doc: TDoc): Uint8Array;
 
   /**
-   * Encode the operations the document holds beyond `remoteStateVector`, or
-   * `null` when there is nothing NEW to send. Implementations must use a
-   * content-aware emptiness test (not payload byte length) so that documents
-   * containing deletions do not re-send no-op diffs forever.
+   * Encode the operations the document may hold beyond `remoteStateVector`, or
+   * `null` when the summary proves there is nothing to send. A summary that
+   * cannot express some operation class MUST be conservative. In particular,
+   * a yjs1 state vector does not describe its delete set, so `encodeDiff` may
+   * return an idempotent deletion payload even for a converged remote; a caller
+   * that owns both documents can compare their full states to suppress it.
    * Throws when `remoteStateVector` is not decodable in this format.
    */
   encodeDiff(doc: TDoc, remoteStateVector: Uint8Array): Uint8Array | null;

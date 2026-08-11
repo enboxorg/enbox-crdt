@@ -4,7 +4,7 @@
  * guarantee consuming applications get.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { encodeEnvelope } from '../index.js';
 import type { TextChange } from '../index.js';
@@ -81,6 +81,26 @@ describe('CollabDoc — flush lifecycle', () => {
     expect(doc.planFlush({ canSnapshot: false }).kind).toBe('incremental');
     doc.destroy();
   });
+
+  it('persists a deletion-only local edit, then settles without a write storm', () => {
+    const doc = createYjs1Doc();
+    doc.insertText(0, 'hello');
+    const base = doc.planFlush();
+    if (base.kind === 'noop') throw new Error('expected a base write');
+    doc.commitFlush(base, { recordId: 'base' });
+
+    doc.deleteText(0, 1);
+    expect(doc.getText()).toBe('ello');
+    expect(doc.hasUnflushedChanges()).toBe(true);
+    const deletion = doc.planFlush();
+    expect(deletion.kind).toBe('incremental');
+    expect(doc.commitFlush(deletion, { recordId: 'delete' })).toEqual({ committed: true });
+
+    expect(doc.hasUnflushedChanges()).toBe(false);
+    expect(doc.planFlush()).toEqual({ kind: 'noop' });
+    expect(doc.planRepublish()).toBeNull();
+    doc.destroy();
+  });
 });
 
 describe('CollabDoc — durable exchange between writers', () => {
@@ -104,6 +124,37 @@ describe('CollabDoc — durable exchange between writers', () => {
     expect(a.applyDurable(plan.delta, { recordId: 'r1' })).toMatchObject({ applied: true, advanced: false });
     a.destroy();
     b.destroy();
+  });
+
+  it('reports deletion-only durable and live frames as advancement', () => {
+    const source = createYjs1Doc();
+    const durable = createYjs1Doc();
+    const live = createYjs1Doc();
+
+    source.insertText(0, 'hello');
+    const base = source.planFlush();
+    if (base.kind === 'noop') throw new Error('expected a base write');
+    source.commitFlush(base, { recordId: 'base' });
+    durable.applyDurable(base.delta, { recordId: 'base' });
+    live.applyDurable(base.delta, { recordId: 'base' });
+
+    source.deleteText(0, 1);
+    const deletion = source.planFlush();
+    if (deletion.kind === 'noop') throw new Error('expected a deletion write');
+
+    expect(durable.applyDurable(deletion.delta, { recordId: 'delete' }))
+      .toMatchObject({ applied: true, advanced: true });
+    expect(durable.applyDurable(deletion.delta, { recordId: 'delete' }))
+      .toMatchObject({ applied: true, advanced: false });
+    expect(durable.hasUnflushedChanges()).toBe(false);
+
+    expect(live.applyLive(deletion.delta)).toMatchObject({ applied: true, advanced: true });
+    expect(live.applyLive(deletion.delta)).toMatchObject({ applied: true, advanced: false });
+    expect(live.hasUnflushedChanges()).toBe(true);
+
+    source.destroy();
+    durable.destroy();
+    live.destroy();
   });
 
   it('survives the squash race: a foreign snapshot never destroys the local tail', () => {
@@ -179,6 +230,83 @@ describe('CollabDoc — durable exchange between writers', () => {
     a.destroy();
     b.destroy();
     c.destroy();
+  });
+
+  it('keeps the newest snapshot floor when an older snapshot arrives late', () => {
+    const base = createYjs1Doc();
+    base.insertText(0, 'base');
+    const snapshot = base.encodeFullState();
+
+    const delayedWriter = createYjs1Doc();
+    delayedWriter.applyDurable(snapshot, { snapshot: true });
+    delayedWriter.insertText(4, ' delayed');
+    const delayed = delayedWriter.planFlush({ canSnapshot: false });
+    if (delayed.kind === 'noop') throw new Error('expected a delayed delta');
+
+    const doc = createYjs1Doc();
+    doc.applyDurable(snapshot, {
+      snapshot: true,
+      messageTimestamp: '2026-08-10T12:00:00.000000Z',
+    });
+    doc.applyDurable(snapshot, {
+      snapshot: true,
+      messageTimestamp: '2026-08-10T10:00:00.000000Z',
+    });
+    doc.applyDurable(delayed.delta, {
+      recordId: 'already-pruned',
+      messageTimestamp: '2026-08-10T11:00:00.000000Z',
+    });
+
+    expect(doc.getText()).toBe('base delayed');
+    expect(doc.hasUnflushedChanges()).toBe(true);
+    base.destroy();
+    delayedWriter.destroy();
+    doc.destroy();
+  });
+
+  it('rejects a stale acknowledgement and commits the fresh re-publish explicitly', () => {
+    const base = createYjs1Doc();
+    base.insertText(0, 'base');
+    const initial = base.encodeFullState();
+
+    const doc = createYjs1Doc();
+    doc.applyDurable(initial, {
+      snapshot: true,
+      messageTimestamp: '2026-08-10T10:00:00.000000Z',
+    });
+    doc.insertText(4, ' local');
+    const inFlight = doc.planFlush({ canSnapshot: false });
+    if (inFlight.kind === 'noop') throw new Error('expected an in-flight write');
+
+    const squasher = createYjs1Doc();
+    squasher.applyDurable(initial, { snapshot: true });
+    squasher.insertText(0, 'new ');
+    doc.applyDurable(squasher.encodeFullState(), {
+      snapshot: true,
+      messageTimestamp: '2026-08-10T12:00:00.000000Z',
+    });
+
+    expect(doc.commitFlush(inFlight, {
+      recordId: 'purged-before-ack',
+      messageTimestamp: '2026-08-10T11:00:00.000000Z',
+    })).toEqual({
+      committed: false,
+      reason: 'superseded',
+      squashFloorTimestamp: '2026-08-10T12:00:00.000000Z',
+    });
+    expect(doc.hasUnflushedChanges()).toBe(true);
+
+    const republish = doc.planRepublish({
+      afterSquashTs: '2026-08-10T12:00:00.000000Z',
+      nowMillis: Date.UTC(2026, 7, 10, 11, 0, 0),
+    });
+    expect(republish).not.toBeNull();
+    expect(doc.commitRepublish(republish!, { recordId: 'fresh' })).toEqual({ committed: true });
+    expect(doc.hasUnflushedChanges()).toBe(false);
+
+    base.destroy();
+    squasher.destroy();
+    doc.destroy();
   });
 
   it('fails closed on foreign formats and raw legacy bytes without touching the text', () => {
@@ -327,5 +455,36 @@ describe('CollabDoc — lifecycle', () => {
     expect(() => doc.getText()).toThrow(/destroyed/);
     expect(() => doc.insertText(0, 'x')).toThrow(/destroyed/);
     expect(() => doc.planFlush()).toThrow(/destroyed/);
+  });
+
+  it('makes subscription teardowns idempotent before and after destroy', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const doc = createYjs1Doc();
+      const offText = doc.onTextChange(() => undefined);
+      const offUpdate = doc.onLocalUpdate(() => undefined);
+      let syncUnsubscribeCount = 0;
+      const offSync = doc.connectLiveSync({
+        broadcastSync: () => undefined,
+        broadcastHeal: () => undefined,
+        onSync: () => () => {
+          syncUnsubscribeCount++;
+        },
+      }, { intervalMs: 60_000 });
+
+      offText();
+      offText();
+      doc.destroy();
+      offText();
+      offUpdate();
+      offUpdate();
+      offSync();
+      offSync();
+
+      expect(syncUnsubscribeCount).toBe(1);
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

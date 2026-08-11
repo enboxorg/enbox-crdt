@@ -37,24 +37,25 @@ export interface Yjs1EngineOptions {
 }
 
 /**
- * Whether a Yjs diff-update carries no NEW operations beyond the base it was
- * diffed against.
+ * Whether a Yjs diff-update carries no operations at all.
  *
- * `Y.encodeStateAsUpdate(doc, sv)` always RE-EMITS the document's full delete
- * set (Yjs cannot diff the delete set against a state vector), so a fully
- * synced document containing deletions produces a non-trivial byte payload
- * that introduces nothing new. Byte-length emptiness tests therefore re-send
- * no-op diffs forever; `Y.parseUpdateMeta(update).to` is non-empty IFF the
- * update carries genuinely new structs, which is the correct,
- * deletion-tolerant test.
- *
- * (A residual consisting ONLY of a deletion the remote lacks is inherently
- * indistinguishable here — that gap heals through the durable log, and
- * re-application is harmlessly idempotent. This matches Yjs's own diff
- * semantics.)
+ * A state vector describes structs but NOT which of those structs have been
+ * deleted. `Y.encodeStateAsUpdate(doc, sv)` therefore re-emits the document's
+ * delete set even when the remote may already have it. We must preserve that
+ * conservative payload: dropping it would also drop a deletion the remote
+ * genuinely lacks. Callers that own both documents (notably `CollabDoc`) use a
+ * full-state equality check to suppress redundant durable writes; live peers
+ * harmlessly re-apply the idempotent delete set during reconciliation.
  */
 function isEmptyUpdate(update: Uint8Array): boolean {
-  return Y.parseUpdateMeta(update).to.size === 0;
+  const decoded = Y.decodeUpdate(update);
+  return decoded.structs.length === 0 && decoded.ds.clients.size === 0;
+}
+
+/** Compare optional Yjs pending-update buffers. */
+function optionalBytesEqual(a: Uint8Array | null, b: Uint8Array | null): boolean {
+  if (a === null || b === null) return a === b;
+  return bytesEqual(a, b);
 }
 
 /** Convert a Y.Text event delta into sequential {@link TextEdit} splices. */
@@ -97,9 +98,23 @@ export function createYjs1Engine(options: Yjs1EngineOptions = {}): DocEngine<Y.D
     },
 
     applyDelta(doc: Y.Doc, payload: Uint8Array, origin?: unknown): boolean {
-      const before = Y.encodeStateVector(doc);
-      Y.applyUpdate(doc, payload, origin);
-      return !bytesEqual(before, Y.encodeStateVector(doc));
+      const beforePendingDs = doc.store.pendingDs?.slice() ?? null;
+      const beforePendingStructs = doc.store.pendingStructs?.update.slice() ?? null;
+      let emittedUpdate = false;
+      const onUpdate = (): void => {
+        emittedUpdate = true;
+      };
+
+      doc.on('update', onUpdate);
+      try {
+        Y.applyUpdate(doc, payload, origin);
+      } finally {
+        doc.off('update', onUpdate);
+      }
+
+      return emittedUpdate ||
+        !optionalBytesEqual(beforePendingDs, doc.store.pendingDs) ||
+        !optionalBytesEqual(beforePendingStructs, doc.store.pendingStructs?.update ?? null);
     },
 
     encodeFullState(doc: Y.Doc): Uint8Array {

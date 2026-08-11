@@ -25,6 +25,7 @@
  */
 
 import type { ApplyEnvelopeResult, DocEngine, TextEdit } from './engine.js';
+import { bytesEqual } from './bytes.js';
 import { applyEnvelope } from './engine.js';
 import { computeRepublish, type RepublishOptions, type RepublishResult } from './enbox/index.js';
 import { decodeEnvelope, encodeEnvelope } from './envelope.js';
@@ -58,9 +59,19 @@ export interface DurableDeltaMeta {
 /** Metadata accompanying a successful flush acknowledgement. */
 export interface FlushAckMeta {
   recordId?: string;
-  /** For snapshot acks: the acknowledged write's message timestamp. */
+  /**
+   * The acknowledged write's message timestamp. Supply it for every write so
+   * an acknowledgement that lost a race with a newer snapshot cannot advance
+   * the durable shadow with a record the snapshot already purged.
+   */
   messageTimestamp?: string;
 }
+
+/** Outcome of committing an acknowledged flush or re-publish write. */
+export type FlushCommitResult =
+  | { committed: true }
+  | { committed: false; reason: 'noop' }
+  | { committed: false; reason: 'superseded'; squashFloorTimestamp: string };
 
 /** Options for {@link createCollabDoc}. */
 export interface CollabDocOptions {
@@ -118,6 +129,19 @@ export class CollabDoc<TDoc = unknown> {
     if (this.destroyed) throw new Error('CollabDoc has been destroyed');
   }
 
+  /** Register a teardown shared by explicit unsubscribe and document destroy. */
+  private registerTeardown(teardown: () => void): () => void {
+    let active = true;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      this.teardowns.delete(release);
+      teardown();
+    };
+    this.teardowns.add(release);
+    return release;
+  }
+
   // -------------------------------------------------------------------------
   // Text
   // -------------------------------------------------------------------------
@@ -157,11 +181,7 @@ export class CollabDoc<TDoc = unknown> {
     const off = this.engine.observeText(this.live, (edits, origin) => {
       listener({ edits, source: this.classify(origin) });
     });
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   private classify(origin: unknown): TextChangeSource {
@@ -243,8 +263,14 @@ export class CollabDoc<TDoc = unknown> {
     const { payload } = decodeEnvelope(bytes); // header re-parse only; payload is a view
 
     if (meta.snapshot === true) {
-      this.replaceShadow(payload);
-      this.lastSnapshotTimestamp = meta.messageTimestamp ?? this.lastSnapshotTimestamp;
+      const superseded =
+        this.lastSnapshotTimestamp !== undefined &&
+        meta.messageTimestamp !== undefined &&
+        meta.messageTimestamp < this.lastSnapshotTimestamp;
+      if (!superseded) {
+        this.replaceShadow(payload);
+        this.advanceSnapshotFloor(meta.messageTimestamp);
+      }
       return outcome;
     }
 
@@ -283,11 +309,7 @@ export class CollabDoc<TDoc = unknown> {
       if (origin === this.DURABLE || origin === this.LIVE) return;
       listener(encodeEnvelope(this.engine.formatId, payload));
     });
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   // -------------------------------------------------------------------------
@@ -302,7 +324,7 @@ export class CollabDoc<TDoc = unknown> {
    */
   planFlush(options: PlanFlushOptions = {}): FlushPlan {
     this.assertAlive();
-    return planFlush(
+    const plan = planFlush(
       this.engine,
       this.live,
       {
@@ -313,20 +335,47 @@ export class CollabDoc<TDoc = unknown> {
       },
       this.policy,
     );
+    // A yjs1 state vector cannot express delete-set knowledge, so its generic
+    // diff is deliberately conservative. Here we own both documents and can
+    // suppress an incremental write once their canonical full states agree.
+    return plan.kind === 'incremental' && this.isDurablyConverged()
+      ? { kind: 'noop' }
+      : plan;
   }
 
-  /** Record a successful write of `plan` — advances the durable shadow. */
-  commitFlush(plan: FlushPlan, meta: FlushAckMeta = {}): void {
+  /**
+   * Record a successful write of `plan`. An acknowledgement at or below a
+   * newer snapshot floor is rejected as superseded, because that record is no
+   * longer part of durable storage and must remain in the re-publish residual.
+   */
+  commitFlush(plan: FlushPlan, meta: FlushAckMeta = {}): FlushCommitResult {
     this.assertAlive();
-    if (plan.kind === 'noop') return;
+    if (plan.kind === 'noop') return { committed: false, reason: 'noop' };
+    const superseded = this.supersededCommit(meta.messageTimestamp);
+    if (superseded !== undefined) return superseded;
+
     const { payload } = decodeEnvelope(plan.delta);
     if (plan.kind === 'snapshot') {
       this.replaceShadow(payload);
-      this.lastSnapshotTimestamp = meta.messageTimestamp ?? this.lastSnapshotTimestamp;
-      return;
+      this.advanceSnapshotFloor(meta.messageTimestamp);
+      return { committed: true };
     }
     this.engine.applyDelta(this.shadow, payload);
     this.distinctDeltaIds.add(meta.recordId ?? `synthetic:${++syntheticIdCounter}`);
+    return { committed: true };
+  }
+
+  /**
+   * Record a successful fresh write returned by {@link planRepublish}. This is
+   * the re-publish counterpart to {@link commitFlush}; callers should not need
+   * to manufacture a synthetic incremental {@link FlushPlan} merely to advance
+  * the durable shadow.
+  */
+  commitRepublish(republish: RepublishResult, meta: FlushAckMeta = {}): FlushCommitResult {
+    return this.commitFlush(
+      { kind: 'incremental', delta: republish.delta },
+      { ...meta, messageTimestamp: meta.messageTimestamp ?? republish.messageTimestamp },
+    );
   }
 
   /**
@@ -339,13 +388,42 @@ export class CollabDoc<TDoc = unknown> {
    */
   planRepublish(options: RepublishOptions = {}): RepublishResult | null {
     this.assertAlive();
+    if (this.isDurablyConverged()) return null;
     return computeRepublish(this.engine, this.live, this.engine.encodeStateVector(this.shadow), options);
   }
 
   /** Whether durable storage might still lack local operations. */
   hasUnflushedChanges(): boolean {
     this.assertAlive();
-    return this.engine.encodeDiff(this.live, this.engine.encodeStateVector(this.shadow)) !== null;
+    return !this.isDurablyConverged();
+  }
+
+  private isDurablyConverged(): boolean {
+    return bytesEqual(this.engine.encodeFullState(this.live), this.engine.encodeFullState(this.shadow));
+  }
+
+  private advanceSnapshotFloor(messageTimestamp: string | undefined): void {
+    if (
+      messageTimestamp !== undefined &&
+      (this.lastSnapshotTimestamp === undefined || messageTimestamp > this.lastSnapshotTimestamp)
+    ) {
+      this.lastSnapshotTimestamp = messageTimestamp;
+    }
+  }
+
+  private supersededCommit(messageTimestamp: string | undefined): FlushCommitResult | undefined {
+    if (
+      messageTimestamp === undefined ||
+      this.lastSnapshotTimestamp === undefined ||
+      messageTimestamp > this.lastSnapshotTimestamp
+    ) {
+      return undefined;
+    }
+    return {
+      committed: false,
+      reason: 'superseded',
+      squashFloorTimestamp: this.lastSnapshotTimestamp,
+    };
   }
 
   private replaceShadow(snapshotPayload: Uint8Array): void {
@@ -362,7 +440,7 @@ export class CollabDoc<TDoc = unknown> {
 
   /**
    * Wire state-vector reconciliation onto a channel: probes on connect and on
-   * an interval; answers behind peers with exactly their missing diff. Feed
+   * an interval; answers peers with a conservative diff when needed. Feed
    * inbound update/heal frames to {@link applyLive} and outbound
    * {@link onLocalUpdate} frames to the channel — that completes the loop.
    * Returns a teardown (also run by {@link destroy}).
@@ -376,11 +454,7 @@ export class CollabDoc<TDoc = unknown> {
       () => !this.destroyed,
       options,
     );
-    this.teardowns.add(off);
-    return () => {
-      this.teardowns.delete(off);
-      off();
-    };
+    return this.registerTeardown(off);
   }
 
   // -------------------------------------------------------------------------

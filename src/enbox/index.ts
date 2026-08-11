@@ -40,6 +40,9 @@ export const BACKSTOP_ERROR_CODE = 'ProtocolAuthorizationSquashBackstop';
  */
 export const PARENT_GONE_ERROR_CODE = 'ProtocolAuthorizationParentNotFoundConstructingRecordChain';
 
+/** The immediate-parent variant of the terminal parent-gone rejection. */
+export const PARENT_RECORD_NOT_FOUND_ERROR_CODE = 'ProtocolAuthorizationParentRecordNotFound';
+
 /**
  * Classify a delta write status. Pure.
  *
@@ -53,7 +56,12 @@ export function classifyWriteResult(status: DeltaWriteStatus): WriteClass {
   const { code, errorCode } = status;
   if (code >= 200 && code < 300) return 'ok';
   if (code === 409 && errorCode === BACKSTOP_ERROR_CODE) return 'backstop';
-  if (code === 400 && errorCode === PARENT_GONE_ERROR_CODE) return 'parent-gone';
+  if (
+    code === 400 &&
+    (errorCode === PARENT_GONE_ERROR_CODE || errorCode === PARENT_RECORD_NOT_FOUND_ERROR_CODE)
+  ) {
+    return 'parent-gone';
+  }
   return 'error';
 }
 
@@ -88,10 +96,11 @@ export interface RepublishResult {
 }
 
 /**
- * The re-publish invariant: the envelope-tagged residual beyond a remote state
- * vector, or `null` when local and remote already agree (idempotent — no write
- * storms). On the backstop path the result carries a timestamp strictly newer
- * than the observed squash floor.
+ * The re-publish invariant: the conservative envelope-tagged residual beyond a
+ * remote state vector, or `null` when that summary proves none exists. On the
+ * backstop path the result carries a timestamp strictly newer than the observed
+ * squash floor. Prefer `CollabDoc.planRepublish()` when both live and durable
+ * documents are available; it also suppresses conservative no-op residuals.
  */
 export function computeRepublish<TDoc>(
   engine: MergeEngine<TDoc>,

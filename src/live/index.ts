@@ -6,8 +6,8 @@
  * WebRTC data channels) are a LATENCY optimization: a dropped frame would
  * otherwise stall the receiving document until the durable flush heals it.
  * Reconciliation makes loss a non-event: periodically — and immediately on
- * (re)connect — a peer broadcasts its state vector; any peer holding
- * operations it lacks replies with exactly that diff.
+ * (re)connect — a peer broadcasts its state vector; any peer that may hold
+ * operations it lacks replies with a diff.
  *
  * All frames are envelope-tagged: sync probes carry the format's state-vector
  * encoding; heal replies carry delta payloads. A frame in another format is
@@ -53,10 +53,10 @@ export interface LiveSyncOptions {
  *
  * Behavior:
  * - probes immediately, on every `intervalMs` tick, and on `'connected'`;
- * - replies to a behind-peer's probe with exactly the missing diff on the heal
- *   lane — and sends NOTHING when the probe shows a converged peer, including
- *   converged documents that contain deletions (content-aware emptiness via
- *   the engine, so deletion-bearing rooms do not spray no-op heals);
+ * - replies to a behind-peer's probe with the missing diff on the heal lane;
+ *   formats whose state vector omits an operation class may conservatively
+ *   include it. yjs1 therefore re-sends its idempotent delete set, because the
+ *   probe cannot distinguish a converged peer from one missing only a deletion;
  * - ignores frames that are not envelopes, are in another format, or carry
  *   state vectors the engine rejects (non-member garbage).
  */
