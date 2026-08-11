@@ -6,9 +6,10 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { encodeEnvelope } from '../index.js';
+import { decodeEnvelope, encodeEnvelope } from '../index.js';
 import type { TextChange } from '../index.js';
-import { createYjs1Doc, unwrapYDoc } from '../yjs1/index.js';
+import { unwrapYDoc } from '../yjs1/advanced.js';
+import { createYjs1Doc, mergeYjs1Updates, YJS1_FORMAT } from '../yjs1/index.js';
 
 const NO_BYTE_TRIGGER = 1 << 30;
 
@@ -34,6 +35,22 @@ describe('CollabDoc — editing and events', () => {
     expect(doc.format).toBe('yjs1');
     expect(unwrapYDoc(doc)).toBe(doc.unwrap());
     doc.destroy();
+  });
+
+  it('coalesces raw update batches through the format-owned helper', () => {
+    const source = createYjs1Doc();
+    const payloads: Uint8Array[] = [];
+    source.onLocalUpdate((frame) => payloads.push(decodeEnvelope(frame).payload));
+    source.insertText(0, 'hello');
+    source.insertText(5, ' world');
+
+    const target = createYjs1Doc();
+    const merged = mergeYjs1Updates(payloads);
+    target.applyDurable(encodeEnvelope(YJS1_FORMAT, merged));
+    expect(target.getText()).toBe('hello world');
+
+    source.destroy();
+    target.destroy();
   });
 });
 
@@ -296,16 +313,41 @@ describe('CollabDoc — durable exchange between writers', () => {
     });
     expect(doc.hasUnflushedChanges()).toBe(true);
 
+    const newerRejection = doc.planRepublish({
+      afterSquashTs: '2026-08-10T13:00:00.000000Z',
+      nowMillis: Date.UTC(2026, 7, 10, 11, 0, 0),
+    });
+    expect(newerRejection?.messageTimestamp).toBe('2026-08-10T13:00:00.000001Z');
+
     const republish = doc.planRepublish({
-      afterSquashTs: '2026-08-10T12:00:00.000000Z',
+      afterSquashTs: '2026-08-10T11:00:00.000000Z',
       nowMillis: Date.UTC(2026, 7, 10, 11, 0, 0),
     });
     expect(republish).not.toBeNull();
+    expect(republish?.messageTimestamp).toBe('2026-08-10T12:00:00.000001Z');
     expect(doc.commitRepublish(republish!, { recordId: 'fresh' })).toEqual({ committed: true });
     expect(doc.hasUnflushedChanges()).toBe(false);
 
     base.destroy();
     squasher.destroy();
+    doc.destroy();
+  });
+
+  it('uses an acknowledged local snapshot as the default re-publish floor', () => {
+    const doc = createYjs1Doc({
+      snapshotPolicy: { maxDeltasSinceSnapshot: 0, byteGrowthFactor: 0, byteGrowthFloor: 0 },
+    });
+    doc.insertText(0, 'snapshot');
+    const snapshot = doc.planFlush();
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot');
+    doc.commitFlush(snapshot, {
+      recordId: 'snapshot',
+      messageTimestamp: '2026-08-10T12:00:00.000000Z',
+    });
+
+    doc.insertText(doc.getText().length, ' tail');
+    const republish = doc.planRepublish({ nowMillis: Date.UTC(2026, 7, 10, 11, 0, 0) });
+    expect(republish?.messageTimestamp).toBe('2026-08-10T12:00:00.000001Z');
     doc.destroy();
   });
 

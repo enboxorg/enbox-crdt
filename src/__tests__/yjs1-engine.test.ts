@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 import { applyEnvelope } from '../engine.js';
 import { encodeEnvelope } from '../envelope.js';
-import { yjs1 } from '../yjs1/index.js';
+import { yjs1 } from '../yjs1/advanced.js';
 
 /** Deterministic Fisher-Yates with a tiny LCG, for permutation testing. */
 function seededShuffle<T>(items: T[], seed: number): T[] {

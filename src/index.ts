@@ -1,10 +1,11 @@
 /**
- * @enbox/crdt — format-tagged, cross-language-safe CRDT sync for Enbox dapps.
+ * @enbox/crdt — collaborative document and sync helpers for Enbox applications.
  *
  * Core module: the delta envelope (SPEC.md), the merge-engine seam, and pure
  * flush planning. Subpath exports:
  *
- * - `@enbox/crdt/yjs1`  — the baseline `yjs1` engine (peer dep: yjs 13.6.x)
+ * - `@enbox/crdt/yjs1` — the baseline `yjs1` document factory
+ * - `@enbox/crdt/yjs1/*` — adapters and explicit advanced engine access
  * - `@enbox/crdt/enbox` — DWN write classification + squash timestamp math
  * - `@enbox/crdt/live`  — transport-agnostic state-vector reconciliation
  *
