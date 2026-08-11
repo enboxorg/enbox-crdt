@@ -12,7 +12,7 @@ import {
   squashFloorTimestamp,
 } from '../enbox/index.js';
 import { decodeEnvelope } from '../envelope.js';
-import { yjs1 } from '../yjs1/index.js';
+import { yjs1 } from '../yjs1/advanced.js';
 
 describe('classifyWriteResult', () => {
   it('maps status codes to write classes on errorCode, never prose', () => {
@@ -29,6 +29,18 @@ describe('classifyWriteResult', () => {
     expect(squashFloorTimestamp({ code: 409, info: { squashFloorTimestamp: '2026-08-10T00:00:00.000000Z' } }))
       .toBe('2026-08-10T00:00:00.000000Z');
     expect(squashFloorTimestamp({ code: 409 })).toBeUndefined();
+  });
+
+  it('accepts structural SDK error and result wrappers', () => {
+    const wrapped = {
+      status: {
+        code: 409,
+        errorCode: BACKSTOP_ERROR_CODE,
+        info: { squashFloorTimestamp: '2026-08-10T00:00:00.000000Z' },
+      },
+    };
+    expect(classifyWriteResult(wrapped)).toBe('backstop');
+    expect(squashFloorTimestamp(wrapped)).toBe('2026-08-10T00:00:00.000000Z');
   });
 });
 

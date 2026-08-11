@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 import { decodeEnvelope, encodeEnvelope } from '../envelope.js';
 import { wireLiveSync } from '../live/index.js';
-import { yjs1 } from '../yjs1/index.js';
+import { yjs1 } from '../yjs1/advanced.js';
 
 interface FakeChannel {
   syncFrames: Uint8Array[];

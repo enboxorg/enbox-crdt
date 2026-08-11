@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 import { decodeEnvelope } from '../envelope.js';
 import { DEFAULT_SNAPSHOT_POLICY, encodeResidual, planFlush, shouldSnapshot } from '../plan.js';
-import { yjs1 } from '../yjs1/index.js';
+import { yjs1 } from '../yjs1/advanced.js';
 
 const freshState = () => ({
   lastFlushedStateVector: Y.encodeStateVector(new Y.Doc()),

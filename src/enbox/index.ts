@@ -27,6 +27,14 @@ export interface DeltaWriteStatus {
   info?: { squashFloorTimestamp?: string };
 }
 
+/** A structural SDK error/result wrapper carrying a DWN status. */
+export interface DeltaWriteStatusCarrier {
+  readonly status: DeltaWriteStatus;
+}
+
+/** Accepted input for write classification and squash-floor extraction. */
+export type DeltaWriteStatusInput = DeltaWriteStatus | DeltaWriteStatusCarrier;
+
 /** Classification of a delta write result. */
 export type WriteClass = 'ok' | 'backstop' | 'parent-gone' | 'error';
 
@@ -52,7 +60,8 @@ export const PARENT_RECORD_NOT_FOUND_ERROR_CODE = 'ProtocolAuthorizationParentRe
  * - `error`       — anything else (transient; keep operations local, retry on
  *                   the next convergence opportunity).
  */
-export function classifyWriteResult(status: DeltaWriteStatus): WriteClass {
+export function classifyWriteResult(input: DeltaWriteStatusInput): WriteClass {
+  const status = 'status' in input ? input.status : input;
   const { code, errorCode } = status;
   if (code >= 200 && code < 300) return 'ok';
   if (code === 409 && errorCode === BACKSTOP_ERROR_CODE) return 'backstop';
@@ -66,7 +75,8 @@ export function classifyWriteResult(status: DeltaWriteStatus): WriteClass {
 }
 
 /** Read the squash floor timestamp from a backstop rejection, if present. */
-export function squashFloorTimestamp(status: DeltaWriteStatus): string | undefined {
+export function squashFloorTimestamp(input: DeltaWriteStatusInput): string | undefined {
+  const status = 'status' in input ? input.status : input;
   const floor = status.info?.squashFloorTimestamp;
   return typeof floor === 'string' ? floor : undefined;
 }
@@ -74,9 +84,10 @@ export function squashFloorTimestamp(status: DeltaWriteStatus): string | undefin
 /** Options for {@link computeRepublish}. */
 export interface RepublishOptions {
   /**
-   * The squash floor parsed from a backstop rejection. When present, the
-   * result's `messageTimestamp` is forced to `max(localNow, floor + 1µs)` so a
-   * writer whose clock is BEHIND the squasher cannot livelock into a second 409.
+   * A squash floor parsed from a backstop rejection. `CollabDoc.planRepublish`
+   * defaults this to its newest observed or acknowledged snapshot; pass an
+   * explicit value when a rejection reports a newer floor. When present, the
+   * result's `messageTimestamp` is forced to `max(localNow, floor + 1µs)`.
    */
   afterSquashTs?: string;
   /** Local "now" in epoch milliseconds; injected for deterministic tests. */

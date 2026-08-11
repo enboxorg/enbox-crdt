@@ -3,11 +3,10 @@
  * collaborative document ENTIRELY through this API: text access, change
  * observation, undo, position anchors, durable/live delta application, flush
  * planning, and realtime reconciliation. The underlying CRDT library never
- * appears in application code; {@link CollabDoc.unwrap} is the one explicit
- * escape hatch (editor bindings), and using it is opt-in.
+ * appears in ordinary application code; {@link CollabDoc.unwrap} remains only
+ * as an advanced native compatibility escape hatch.
  *
- * Internally a CollabDoc owns TWO engine documents, the bookkeeping model
- * proven by notesd:
+ * Internally a CollabDoc owns two engine documents:
  *
  * - the LIVE document — local edits, applied durable deltas, and realtime
  *   frames; the state the UI renders;
@@ -85,6 +84,13 @@ export interface PlanFlushOptions {
 }
 
 let syntheticIdCounter = 0;
+
+/** Later of two canonical DWN timestamps, ignoring absent values. */
+function latestTimestamp(a: string | undefined, b: string | undefined): string | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return a >= b ? a : b;
+}
 
 /**
  * The application-facing collaborative document. Create via
@@ -369,8 +375,8 @@ export class CollabDoc<TDoc = unknown> {
    * Record a successful fresh write returned by {@link planRepublish}. This is
    * the re-publish counterpart to {@link commitFlush}; callers should not need
    * to manufacture a synthetic incremental {@link FlushPlan} merely to advance
-  * the durable shadow.
-  */
+   * the durable shadow.
+   */
   commitRepublish(republish: RepublishResult, meta: FlushAckMeta = {}): FlushCommitResult {
     return this.commitFlush(
       { kind: 'incremental', delta: republish.delta },
@@ -381,15 +387,18 @@ export class CollabDoc<TDoc = unknown> {
   /**
    * The re-publish invariant: the residual this document holds beyond durable
    * storage, as a fresh envelope-tagged delta — or `null` when converged. Call
-   * after a write rejection or after applying a foreign snapshot. On the
-   * squash-backstop path pass `afterSquashTs` (see `@enbox/crdt/enbox`
-   * `squashFloorTimestamp`) and stamp the returned `messageTimestamp` on the
-   * fresh record.
+   * after a write rejection or after applying a foreign snapshot. The newest
+   * observed or acknowledged snapshot is used as the timestamp floor. Pass an
+   * explicit `afterSquashTs` only when a rejection reports a newer floor, and
+   * stamp the returned `messageTimestamp` on the fresh record.
    */
   planRepublish(options: RepublishOptions = {}): RepublishResult | null {
     this.assertAlive();
     if (this.isDurablyConverged()) return null;
-    return computeRepublish(this.engine, this.live, this.engine.encodeStateVector(this.shadow), options);
+    return computeRepublish(this.engine, this.live, this.engine.encodeStateVector(this.shadow), {
+      ...options,
+      afterSquashTs: latestTimestamp(options.afterSquashTs, this.lastSnapshotTimestamp),
+    });
   }
 
   /** Whether durable storage might still lack local operations. */
@@ -468,12 +477,11 @@ export class CollabDoc<TDoc = unknown> {
   }
 
   /**
-   * ESCAPE HATCH: the engine-native live document (a `Y.Doc` for `yjs1`).
-   * Exists solely for editor bindings that require the native document (e.g.
-   * y-codemirror) until first-class adapters ship. Everything written through
-   * it is treated as a local edit; do not apply remote data through it —
-   * use {@link applyDurable}/{@link applyLive} so the durable bookkeeping and
-   * change provenance stay correct.
+   * Advanced compatibility escape hatch for engine integrations without a
+   * dedicated adapter. Ordinary consumers should use the adapter subpaths.
+   * Everything written through the native document is treated as a local edit;
+   * do not apply remote data through it — use {@link applyDurable}/
+   * {@link applyLive} so durable bookkeeping and change provenance stay correct.
    */
   unwrap(): TDoc {
     this.assertAlive();

@@ -1,8 +1,6 @@
 /**
- * Pure flush planning — turns document state into delta-write decisions, with
- * all I/O owned by the caller. Generalized from the notesd delta engine, which
- * proved these semantics in production; here they are engine-generic and every
- * returned delta is envelope-tagged.
+ * Pure flush planning — turns document state into envelope-tagged delta-write
+ * decisions while leaving all I/O with the caller.
  *
  * @module
  */

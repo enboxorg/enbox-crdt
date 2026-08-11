@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 
 import { applyEnvelope } from '../engine.js';
 import { decodeEnvelope, encodeEnvelope, EnvelopeError } from '../envelope.js';
-import { yjs1 } from '../yjs1/index.js';
+import { yjs1 } from '../yjs1/advanced.js';
 
 const readFixture = <T>(name: string): T =>
   JSON.parse(readFileSync(new URL(`../../fixtures/${name}`, import.meta.url), 'utf8')) as T;

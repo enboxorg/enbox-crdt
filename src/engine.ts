@@ -13,9 +13,9 @@
  *   this library's API and never with the underlying CRDT library. Consumed
  *   by {@link ../collab-doc.js | createCollabDoc}.
  *
- * `@enbox/crdt/yjs1` provides the baseline implementation of both tiers.
- * Future engines (`loro1`, `automerge1`, …) slot in per-document via the
- * envelope's format tag without touching applications.
+ * `@enbox/crdt/yjs1/advanced` provides the baseline implementation of both
+ * tiers. Future engines (`loro1`, `automerge1`, …) slot in per-document via
+ * the envelope's format tag without touching applications.
  *
  * @module
  */
