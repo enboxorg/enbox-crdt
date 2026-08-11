@@ -1,6 +1,6 @@
 {
   "name": "@enbox/crdt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Collaborative documents, durable sync planning, realtime healing, and editor persistence adapters for Enbox applications",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,5 +1,11 @@
 # @enbox/crdt
 
+## 0.1.2
+
+### Patch Changes
+
+- [#4](https://github.com/enboxorg/enbox-crdt/pull/4) [`a477210`](https://github.com/enboxorg/enbox-crdt/commit/a477210e4861ec91cabeb02a098063f9d7a617c0) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Own the yjs1 runtime and add awareness, CodeMirror, and IndexedDB adapters that keep native CRDT objects out of application code. Move native engine access to the explicit `yjs1/advanced` subpath, infer known snapshot floors during re-publish planning, and accept structural SDK status wrappers in write classification.
+
 ## 0.1.1
 
 ### Patch Changes
