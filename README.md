@@ -253,24 +253,29 @@ await persistence.clearData();
 The persistence handle owns its teardown and is safe to release more than once,
 including after the collaborative document has been destroyed.
 
-## Raw yjs1 payload batching
+## Framed yjs1 update batching
 
-Enveloped frames should be used for new storage and transports. A protocol that
-already stores raw `yjs1` update-v1 payloads can batch them without importing
-the runtime:
+Batch the frames emitted by `onLocalUpdate()` directly for durable storage or
+realtime transport. Every input must be a valid SDK envelope tagged `yjs1`:
 
 ```ts
-import { mergeYjs1Updates } from '@enbox/crdt/yjs1';
+import { mergeYjs1Frames } from '@enbox/crdt/yjs1';
 
-const batch = mergeYjs1Updates(rawUpdates);
+const batch = mergeYjs1Frames(frames);
+peer.applyLive(batch);
 ```
+
+The result is another SDK frame. Empty batches produce a no-op frame; duplicate
+updates and deletions retain Yjs merge semantics. Raw updates, malformed
+envelopes, and other format tags are rejected. Native payload merging remains
+available through the engine's `mergeDeltas` on `@enbox/crdt/yjs1/advanced`.
 
 ## Package exports
 
 | Export | Purpose |
 | --- | --- |
 | `@enbox/crdt` | `CollabDoc`, envelope helpers, engine contracts, and flush planning |
-| `@enbox/crdt/yjs1` | Primary document factory, constants, and raw update batching |
+| `@enbox/crdt/yjs1` | Primary document factory, constants, and framed update batching |
 | `@enbox/crdt/yjs1/advanced` | Advanced native engine compatibility escape hatch |
 | `@enbox/crdt/yjs1/awareness` | Ephemeral participant state and awareness codecs |
 | `@enbox/crdt/yjs1/codemirror` | CodeMirror 6 binding and neutral undo lifecycle |
