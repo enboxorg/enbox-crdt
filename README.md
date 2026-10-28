@@ -51,22 +51,6 @@ for (const record of await queryDeltaRecords()) {
   });
 }
 
-const plan = doc.planFlush({ canSnapshot: maySquash });
-if (plan.kind !== 'noop') {
-  const record = await writeDelta(plan.delta, {
-    squash: plan.kind === 'snapshot',
-  });
-  const outcome = doc.commitFlush(plan, {
-    recordId: record.id,
-    messageTimestamp: record.timestamp,
-  });
-  if (!outcome.committed && outcome.reason === 'superseded') {
-    scheduleRepublish();
-  }
-}
-
-offText();
-doc.destroy();
 ```
 
 `CollabDoc` maintains a live document and a durable shadow. A flush advances
@@ -74,17 +58,80 @@ the shadow only after its write is acknowledged. Applying a snapshot replaces
 the shadow without discarding live-only work, so omitted operations become the
 next residual automatically.
 
+## Durable write coordination
+
+`DurableWriter` owns one serialized plan/write/commit sequence per document,
+including debounce, sustained-edit backstops, squash-conflict recovery, and
+convergence after durable events. Bind the existing native create operation:
+
+```ts
+import { DurableWriter } from '@enbox/crdt/enbox';
+
+const writer = new DurableWriter({
+  doc,
+  create: request => records.create('note/delta', {
+    ...request,
+    parentContextId: note.contextId,
+  }),
+  timers: { idleMs: 2000, backstopMs: 30000, convergenceMs: 1000 },
+  canSquash: maySquash,
+  onParentGone: closeDeletedDocument,
+  onError: reportWriteFailure,
+});
+const stop = doc.onLocalUpdate(() => writer.onLocalChange());
+
+// Route subscribed durable records through the same writer.
+writer.applyDurable(frame, { recordId, snapshot, messageTimestamp });
+
+// Before a lifecycle transition that requires durability:
+await writer.drain();
+stop();
+writer.dispose();
+offText();
+doc.destroy();
+```
+
+The callback returns the native record's `id` and `timestamp`, or throws its
+original error. The writer supplies `squash` and matching timestamp fields;
+protocol paths, parent contexts, and any wire-format conversion stay in the
+binding. Application timing values can change with `setTimers()`, and updated
+squash authority with `setCanSquash()`.
+
+A backstop can reveal a newer squash before its contents arrive. The document
+then discards its outdated durable-shadow assumptions and recovers through a
+dependency-complete incremental record. Compaction remains disabled until the
+newer snapshot body is observed, preserving operations it has not seen.
+If a backstop omits a usable floor, strict drains keep rejecting the original
+failure. `capturePendingUpdate()` returns a full repair frame. Hydrate a new
+document, merge that frame with `applyLive()`, and construct a replacement writer.
+
+`flush()` makes a best-effort attempt and reports failures through `onError`.
+`drain()` persists every remaining operation and rejects on failure, leaving
+the document available for retry. `republishNow()` attempts the fresh residual
+after local-cache recovery; the application decides when editing may begin.
+`dispose()` stops scheduling without discarding or destroying the document.
+Applications choose when to subscribe to local changes and how to handle
+read-only access, failed drains, and terminal parent deletion.
+Notification callback failures do not replace write failures or reject a
+background flush.
+
+The planning and commit primitives remain available for custom persistence.
+
 ## Re-publishing after a squash
 
 ```ts
 import {
+  addMicrosecondTick,
   classifyWriteResult,
   squashFloorTimestamp,
 } from '@enbox/crdt/enbox';
 
 if (classifyWriteResult(error) === 'backstop') {
+  const floor = squashFloorTimestamp(error);
+  if (floor === undefined) throw error;
+  try { addMicrosecondTick(floor); } catch { throw error; }
   const republish = doc.planRepublish({
-    afterSquashTs: squashFloorTimestamp(error),
+    afterSquashTs: floor,
   });
   if (republish !== null) {
     const record = await writeFreshDelta(
@@ -99,9 +146,10 @@ if (classifyWriteResult(error) === 'backstop') {
 }
 ```
 
-`planRepublish()` automatically uses the newest snapshot timestamp observed or
-acknowledged by the document. Supply `afterSquashTs` only when a server
-rejection reports a newer floor.
+`planRepublish()` retains the newest observed, acknowledged, or reported
+snapshot floor. Supply `afterSquashTs` only when a server rejection reports a
+newer floor. Missing or invalid floor metadata requires document reconstruction;
+an old shadow cannot establish which dependencies survived the squash.
 
 ## Realtime healing
 
@@ -227,7 +275,7 @@ const batch = mergeYjs1Updates(rawUpdates);
 | `@enbox/crdt/yjs1/awareness` | Ephemeral participant state and awareness codecs |
 | `@enbox/crdt/yjs1/codemirror` | CodeMirror 6 binding and neutral undo lifecycle |
 | `@enbox/crdt/yjs1/indexeddb` | Browser persistence lifecycle |
-| `@enbox/crdt/enbox` | DWN write classification and squash timestamp helpers |
+| `@enbox/crdt/enbox` | Durable write coordination, DWN classification, and squash timestamp helpers |
 | `@enbox/crdt/live` | Transport-agnostic state-vector reconciliation |
 
 The wire-format contract and conformance fixtures are documented in

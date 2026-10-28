@@ -324,7 +324,7 @@ describe('CollabDoc — durable exchange between writers', () => {
       nowMillis: Date.UTC(2026, 7, 10, 11, 0, 0),
     });
     expect(republish).not.toBeNull();
-    expect(republish?.messageTimestamp).toBe('2026-08-10T12:00:00.000001Z');
+    expect(republish?.messageTimestamp).toBe('2026-08-10T13:00:00.000001Z');
     expect(doc.commitRepublish(republish!, { recordId: 'fresh' })).toEqual({ committed: true });
     expect(doc.hasUnflushedChanges()).toBe(false);
 
@@ -528,5 +528,44 @@ describe('CollabDoc — lifecycle', () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+});
+
+describe('CollabDoc — reported squash knowledge', () => {
+  it('invalidates an apparently converged shadow and keeps compaction disabled until the unseen snapshot arrives', () => {
+    const base = createYjs1Doc();
+    base.insertText(0, 'old');
+    const doc = createYjs1Doc({ snapshotPolicy: { maxDeltasSinceSnapshot: 0, byteGrowthFactor: 0, byteGrowthFloor: 0 } });
+    const previous = '2026-01-01T00:00:00.000000Z';
+    const floor = '2026-02-01T00:00:00.000000Z';
+    doc.applyDurable(base.encodeFullState(), { snapshot: true, messageTimestamp: previous });
+    expect(doc.hasUnflushedChanges()).toBe(false);
+    const recovery = doc.planRepublish({ afterSquashTs: floor, nowMillis: 0 });
+    expect(recovery).not.toBeNull();
+    expect(doc.hasUnflushedChanges()).toBe(true);
+    expect(doc.planFlush().kind).toBe('incremental');
+    doc.applyDurable(base.encodeFullState(), { recordId: 'untimed-old-echo' });
+    expect(doc.hasUnflushedChanges()).toBe(true);
+    expect(doc.commitFlush(doc.planFlush(), { recordId: 'unverified-ack' })).toEqual({
+      committed: false, reason: 'superseded', squashFloorTimestamp: floor,
+    });
+    const rebuilt = createYjs1Doc();
+    rebuilt.applyDurable(recovery!.delta);
+    expect(rebuilt.getText()).toBe('old');
+    expect(doc.commitRepublish(recovery!, { recordId: 'recovered' })).toEqual({ committed: true });
+    expect(doc.hasUnflushedChanges()).toBe(false);
+    expect(doc.planRepublish({ afterSquashTs: floor })).toBeNull();
+
+    doc.insertText(3, ' + new');
+    doc.applyDurable(base.encodeFullState(), { snapshot: true, messageTimestamp: previous });
+    doc.applyDurable(base.encodeFullState(), { snapshot: true });
+    expect(doc.planFlush().kind).toBe('incremental');
+    const remote = createYjs1Doc();
+    remote.insertText(0, 'remote');
+    doc.applyDurable(remote.encodeFullState(), { snapshot: true, messageTimestamp: floor });
+    expect(doc.planFlush().kind).toBe('snapshot');
+    expect(doc.getText()).toContain('remote');
+    expect(doc.getText()).toContain('old + new');
+    base.destroy(); doc.destroy(); rebuilt.destroy(); remote.destroy();
   });
 });

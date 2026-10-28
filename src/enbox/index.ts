@@ -1,7 +1,7 @@
 /**
- * Enbox/DWN integration: delta write-result classification and the squash
- * temporal-backstop timestamp math. Pure functions; no Enbox SDK dependency —
- * callers pass the reply status shape they already hold.
+ * Enbox/DWN integration: a serialized durable document writer, write-result
+ * classification, and squash temporal-backstop timestamp math. Native record
+ * callbacks and structural status shapes keep this module SDK-independent.
  *
  * The semantics mirror the server-enforced `$squash` contract in
  * `@enbox/dwn-sdk-js`: a squash write atomically removes strictly older
@@ -88,6 +88,8 @@ export interface RepublishOptions {
    * defaults this to its newest observed or acknowledged snapshot; pass an
    * explicit value when a rejection reports a newer floor. When present, the
    * result's `messageTimestamp` is forced to `max(localNow, floor + 1µs)`.
+   * `CollabDoc.planRepublish()` also records that floor and invalidates an
+   * older shadow before deciding which operations still need persistence.
    */
   afterSquashTs?: string;
   /** Local "now" in epoch milliseconds; injected for deterministic tests. */
@@ -189,3 +191,6 @@ function formatEpochMicros(epochMicros: bigint): string {
   const base = formatDwnTimestamp(epochMillis); // …mmm000Z
   return base.replace(/(\d{3})000Z$/, (_full, ms: string) => `${ms}${pad(subMillisMicros, 3)}Z`);
 }
+
+export { DurableWriter } from './durable-writer.js';
+export type { DurableWriterOptions, DurableWriterTimers, DurableWriterClock, DurableWriteRequest, DurableWriteRecord } from './durable-writer.js';
