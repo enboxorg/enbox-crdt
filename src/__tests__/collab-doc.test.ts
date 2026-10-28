@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { decodeEnvelope, encodeEnvelope } from '../index.js';
 import type { TextChange } from '../index.js';
 import { unwrapYDoc } from '../yjs1/advanced.js';
-import { createYjs1Doc, mergeYjs1Updates, YJS1_FORMAT } from '../yjs1/index.js';
+import { createYjs1Doc, mergeYjs1Frames, YJS1_FORMAT } from '../yjs1/index.js';
 
 const NO_BYTE_TRIGGER = 1 << 30;
 
@@ -37,20 +37,73 @@ describe('CollabDoc — editing and events', () => {
     doc.destroy();
   });
 
-  it('coalesces raw update batches through the format-owned helper', () => {
+  it('coalesces framed updates out of order with duplicates and deletions', () => {
     const source = createYjs1Doc();
-    const payloads: Uint8Array[] = [];
-    source.onLocalUpdate((frame) => payloads.push(decodeEnvelope(frame).payload));
+    const frames: Uint8Array[] = [];
+    source.onLocalUpdate((frame) => frames.push(frame));
     source.insertText(0, 'hello');
     source.insertText(5, ' world');
+    source.deleteText(0, 1);
 
     const target = createYjs1Doc();
-    const merged = mergeYjs1Updates(payloads);
-    target.applyDurable(encodeEnvelope(YJS1_FORMAT, merged));
-    expect(target.getText()).toBe('hello world');
+    const merged = mergeYjs1Frames([...frames].reverse().concat(frames));
+    expect(decodeEnvelope(merged).format).toBe(YJS1_FORMAT);
+    expect(target.applyDurable(merged)).toMatchObject({ applied: true, advanced: true });
+    expect(target.getText()).toBe('ello world');
+    expect(target.applyDurable(merged)).toMatchObject({ applied: true, advanced: false });
 
     source.destroy();
     target.destroy();
+  });
+});
+
+describe('yjs1 framed batching', () => {
+  it('returns a valid no-op frame for empty batches and empty updates', () => {
+    const doc = createYjs1Doc();
+    const empty = doc.encodeFullState();
+    for (const frames of [[], [empty], [empty, empty]]) {
+      const merged = mergeYjs1Frames(frames);
+      expect(decodeEnvelope(merged).format).toBe(YJS1_FORMAT);
+      expect(doc.applyLive(merged)).toMatchObject({ applied: true, advanced: false });
+      expect(doc.getText()).toBe('');
+    }
+    doc.destroy();
+  });
+
+  it('preserves a deletion-only batch against an existing base', () => {
+    const source = createYjs1Doc();
+    source.insertText(0, 'retained base');
+    const target = createYjs1Doc();
+    target.applyDurable(source.encodeFullState());
+    const frames: Uint8Array[] = [];
+    source.onLocalUpdate(frame => frames.push(frame));
+    source.deleteText(0, 9);
+    const merged = mergeYjs1Frames([...frames, ...frames]);
+    expect(target.applyLive(merged)).toMatchObject({ applied: true, advanced: true });
+    expect(target.getText()).toBe('base');
+    expect(target.applyLive(merged)).toMatchObject({ applied: true, advanced: false });
+    source.destroy(); target.destroy();
+  });
+
+  it('validates every frame format before merging a mixed batch', () => {
+    const doc = createYjs1Doc();
+    const valid = doc.encodeFullState();
+    const foreign = encodeEnvelope('loro1', decodeEnvelope(valid).payload);
+    expect(() => mergeYjs1Frames([valid, foreign])).toThrow("expected 'yjs1', received 'loro1'");
+    expect(() => mergeYjs1Frames([foreign, valid])).toThrow(TypeError);
+    doc.destroy();
+  });
+
+  it('rejects raw updates and malformed envelopes within a batch', () => {
+    const doc = createYjs1Doc();
+    const valid = doc.encodeFullState();
+    const unsupported = valid.slice();
+    unsupported[4] = 255;
+    for (const malformed of [decodeEnvelope(valid).payload, valid.slice(0, 5), unsupported]) {
+      expect(() => mergeYjs1Frames([malformed])).toThrow();
+      expect(() => mergeYjs1Frames([valid, malformed])).toThrow();
+    }
+    doc.destroy();
   });
 });
 
