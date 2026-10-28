@@ -1,5 +1,11 @@
 # @enbox/crdt
 
+## 0.1.3
+
+### Patch Changes
+
+- [#6](https://github.com/enboxorg/enbox-crdt/pull/6) [`7188891`](https://github.com/enboxorg/enbox-crdt/commit/718889121065703416f41d74cf03f42f8adea369) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Add a durable document writer with serialized native creates, configurable scheduling, strict drains, and squash recovery. Newer reported squash floors invalidate outdated durable knowledge so recovery preserves dependency-complete updates, while malformed floors retain an actionable failure and full repair state. Application notification failures leave persistence outcomes unchanged.
+
 ## 0.1.2
 
 ### Patch Changes
