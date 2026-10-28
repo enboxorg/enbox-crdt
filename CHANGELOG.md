@@ -1,5 +1,11 @@
 # @enbox/crdt
 
+## 0.1.4
+
+### Patch Changes
+
+- [#8](https://github.com/enboxorg/enbox-crdt/pull/8) [`4582157`](https://github.com/enboxorg/enbox-crdt/commit/458215746d97ba9f53d639212767250e2f73b958) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Replace the application-facing raw update batch helper with mergeYjs1Frames, which validates SDK envelope formats, delegates payload merging to the existing Yjs engine, and returns one framed update. Native raw payload merging remains available through the advanced engine surface.
+
 ## 0.1.3
 
 ### Patch Changes
