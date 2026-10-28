@@ -869,3 +869,114 @@ describe('DurableWriter — native create failures and disposal', () => {
     expect(h.clock.pending()).toBe(0);
   });
 });
+
+describe('DurableWriter — recovery before a squash body is observed', () => {
+  it.each(['pending edit', 'pruned echo', 'failed retry', 'newer backstop'] as const)('preserves a cold edit and unseen remote state after %s', async (scenario) => {
+    const base = createYjs1Doc();
+    base.insertText(0, 'old');
+    const doc = createYjs1Doc({ snapshotPolicy: { maxDeltasSinceSnapshot: 0, byteGrowthFactor: 0, byteGrowthFloor: 0 } });
+    doc.applyDurable(base.encodeFullState(), { snapshot: true, messageTimestamp: '2026-01-01T00:00:00.000000Z' });
+    doc.insertText(3, ' + new');
+    const remote = createYjs1Doc();
+    remote.insertText(0, 'remote');
+    const floor = '2026-02-02T00:00:00.000000Z';
+    const storage = [remote.encodeFullState()];
+    const requests: DurableWriteRequest[] = [];
+    const unavailable = new Error('Retry unavailable');
+    const newerFloor = '2026-03-03T00:00:00.000000Z';
+    const newerRejection = backstop(newerFloor);
+    const writer = new DurableWriter({
+      doc, timers: TEST_TIMERS, clock: makeClock(),
+      create: async request => {
+        requests.push(request);
+        if (requests.length === 1) {
+          if (scenario === 'pruned echo') {
+            doc.applyDurable(request.data, { recordId: 'older-equivalent-write', messageTimestamp: '2026-01-02T00:00:00.000000Z' });
+            expect(doc.hasUnflushedChanges()).toBe(false);
+          }
+          throw backstop(floor);
+        }
+        expect(request.squash).toBeUndefined();
+        if (scenario === 'failed retry' && requests.length === 2) throw unavailable;
+        if (scenario === 'newer backstop' && requests.length === 2) {
+          doc.applyDurable(request.data, { recordId: 'pruned-recovery-echo', messageTimestamp: request.messageTimestamp });
+          expect(doc.hasUnflushedChanges()).toBe(false);
+          throw newerRejection;
+        }
+        expect(request.messageTimestamp! > (scenario === 'newer backstop' ? newerFloor : floor)).toBe(true);
+        storage.push(request.data);
+        return { id: `saved-${requests.length}`, timestamp: request.messageTimestamp! };
+      },
+    });
+    if (scenario === 'failed retry' || scenario === 'newer backstop') {
+      await expect(writer.drain()).rejects.toBe(scenario === 'failed retry' ? unavailable : newerRejection);
+      expect(doc.hasUnflushedChanges()).toBe(true);
+      expect(doc.planFlush().kind).toBe('incremental');
+    }
+    await writer.drain();
+    expect(doc.hasUnflushedChanges()).toBe(false);
+    const attempts = requests.length;
+    await writer.drain();
+    expect(requests).toHaveLength(attempts);
+    writer.dispose(); doc.destroy();
+    const reopened = documentFromDeltas(storage.map((data, index) => ({ recordId: `stored-${index}`, data })));
+    expect(reopened.getText()).toContain('old + new');
+    expect(reopened.getText()).toContain('remote');
+    base.destroy(); remote.destroy(); reopened.destroy();
+  });
+});
+
+describe('DurableWriter — notification isolation', () => {
+  it.each([
+    ['error', 'throw'], ['error', 'reject'], ['parent', 'throw'], ['parent', 'reject'],
+  ] as const)('preserves the original %s failure when its reporter uses %s', async (kind, mode) => {
+    const failure = kind === 'parent' ? pageGone() : transient();
+    const reporterFailure = new Error('Reporter failed');
+    const report = vi.fn(() => { if (mode === 'throw') throw reporterFailure; return Promise.reject(reporterFailure); });
+    const h = makeLoop({ writeImpl: () => failure, onError: report, onParentGone: report });
+    type(h.doc, 'not persisted');
+    await expect(h.loop.drain()).rejects.toBe(failure);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(report).toHaveBeenCalledOnce();
+    expect(h.doc.hasUnflushedChanges()).toBe(true);
+    h.loop.dispose(); h.doc.destroy();
+  });
+
+  it.each(['throw', 'reject'] as const)('keeps a timer-triggered failure handled when onError uses %s', async mode => {
+    const report = () => { if (mode === 'throw') throw new Error('Reporter failed'); return Promise.reject(new Error('Reporter failed')); };
+    const h = makeLoop({ writeImpl: () => transient(), onError: report });
+    type(h.doc, 'not persisted');
+    h.loop.onLocalChange();
+    h.clock.advance(TEST_TIMERS.idleMs);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(h.create).toHaveBeenCalledOnce();
+    expect(h.doc.hasUnflushedChanges()).toBe(true);
+    h.loop.dispose(); h.doc.destroy();
+  });
+});
+
+describe('DurableWriter — unusable backstop metadata', () => {
+  it.each([undefined, 'not-a-timestamp'])('keeps an unusable floor %s actionable even when an obsolete echo looked converged', async floor => {
+    const failure = Object.assign(new Error('Backstop without floor'), {
+      status: { code: 409, errorCode: 'ProtocolAuthorizationSquashBackstop', ...(floor === undefined ? {} : { info: { squashFloorTimestamp: floor } }) },
+    });
+    const base = createYjs1Doc();
+    base.insertText(0, 'old');
+    const doc = createYjs1Doc();
+    doc.applyDurable(base.encodeFullState());
+    doc.insertText(3, ' + new');
+    const create = vi.fn(async (request: DurableWriteRequest): Promise<never> => {
+      doc.applyDurable(request.data, { recordId: 'obsolete-echo' });
+      expect(doc.hasUnflushedChanges()).toBe(false);
+      throw failure;
+    });
+    const writer = new DurableWriter({ doc, create, timers: TEST_TIMERS, clock: makeClock() });
+    await expect(writer.drain()).rejects.toBe(failure);
+    await expect(writer.drain()).rejects.toBe(failure);
+    expect(create).toHaveBeenCalledOnce();
+    const recovered = createYjs1Doc();
+    recovered.applyLive(writer.capturePendingUpdate()!);
+    expect(recovered.getText()).toBe('old + new');
+    writer.dispose(); doc.destroy(); base.destroy(); recovered.destroy();
+  });
+});

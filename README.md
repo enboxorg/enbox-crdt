@@ -97,6 +97,14 @@ protocol paths, parent contexts, and any wire-format conversion stay in the
 binding. Application timing values can change with `setTimers()`, and updated
 squash authority with `setCanSquash()`.
 
+A backstop can reveal a newer squash before its contents arrive. The document
+then discards its outdated durable-shadow assumptions and recovers through a
+dependency-complete incremental record. Compaction remains disabled until the
+newer snapshot body is observed, preserving operations it has not seen.
+If a backstop omits a usable floor, strict drains keep rejecting the original
+failure. `capturePendingUpdate()` returns a full repair frame. Hydrate a new
+document, merge that frame with `applyLive()`, and construct a replacement writer.
+
 `flush()` makes a best-effort attempt and reports failures through `onError`.
 `drain()` persists every remaining operation and rejects on failure, leaving
 the document available for retry. `republishNow()` attempts the fresh residual
@@ -104,6 +112,8 @@ after local-cache recovery; the application decides when editing may begin.
 `dispose()` stops scheduling without discarding or destroying the document.
 Applications choose when to subscribe to local changes and how to handle
 read-only access, failed drains, and terminal parent deletion.
+Notification callback failures do not replace write failures or reject a
+background flush.
 
 The planning and commit primitives remain available for custom persistence.
 
@@ -111,13 +121,17 @@ The planning and commit primitives remain available for custom persistence.
 
 ```ts
 import {
+  addMicrosecondTick,
   classifyWriteResult,
   squashFloorTimestamp,
 } from '@enbox/crdt/enbox';
 
 if (classifyWriteResult(error) === 'backstop') {
+  const floor = squashFloorTimestamp(error);
+  if (floor === undefined) throw error;
+  try { addMicrosecondTick(floor); } catch { throw error; }
   const republish = doc.planRepublish({
-    afterSquashTs: squashFloorTimestamp(error),
+    afterSquashTs: floor,
   });
   if (republish !== null) {
     const record = await writeFreshDelta(
@@ -132,9 +146,10 @@ if (classifyWriteResult(error) === 'backstop') {
 }
 ```
 
-`planRepublish()` automatically uses the newest snapshot timestamp observed or
-acknowledged by the document. Supply `afterSquashTs` only when a server
-rejection reports a newer floor.
+`planRepublish()` retains the newest observed, acknowledged, or reported
+snapshot floor. Supply `afterSquashTs` only when a server rejection reports a
+newer floor. Missing or invalid floor metadata requires document reconstruction;
+an old shadow cannot establish which dependencies survived the squash.
 
 ## Realtime healing
 

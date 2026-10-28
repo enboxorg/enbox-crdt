@@ -88,6 +88,8 @@ export interface RepublishOptions {
    * defaults this to its newest observed or acknowledged snapshot; pass an
    * explicit value when a rejection reports a newer floor. When present, the
    * result's `messageTimestamp` is forced to `max(localNow, floor + 1µs)`.
+   * `CollabDoc.planRepublish()` also records that floor and invalidates an
+   * older shadow before deciding which operations still need persistence.
    */
   afterSquashTs?: string;
   /** Local "now" in epoch milliseconds; injected for deterministic tests. */

@@ -26,7 +26,7 @@
 import type { ApplyEnvelopeResult, DocEngine, TextEdit } from './engine.js';
 import { bytesEqual } from './bytes.js';
 import { applyEnvelope } from './engine.js';
-import { computeRepublish, type RepublishOptions, type RepublishResult } from './enbox/index.js';
+import { addMicrosecondTick, computeRepublish, type RepublishOptions, type RepublishResult } from './enbox/index.js';
 import { decodeEnvelope, encodeEnvelope } from './envelope.js';
 import { wireLiveSync, type LiveSyncOptions, type SyncChannel } from './live/index.js';
 import { DEFAULT_SNAPSHOT_POLICY, planFlush, type FlushPlan, type SnapshotPolicy } from './plan.js';
@@ -115,6 +115,8 @@ export class CollabDoc<TDoc = unknown> {
   private readonly distinctDeltaIds = new Set<string>();
   private lastSnapshotBytes = 0;
   private lastSnapshotTimestamp: string | undefined;
+  /** A reported squash whose contents have not been observed; compaction cannot cover its unknown operations. */
+  private unseenSnapshotTimestamp: string | undefined;
 
   private undoHandle: ReturnType<DocEngine<TDoc>['createUndo']> | undefined;
   private readonly teardowns = new Set<() => void>();
@@ -271,20 +273,24 @@ export class CollabDoc<TDoc = unknown> {
 
     if (meta.snapshot === true) {
       const superseded =
-        this.lastSnapshotTimestamp !== undefined &&
-        meta.messageTimestamp !== undefined &&
-        meta.messageTimestamp < this.lastSnapshotTimestamp;
+        (this.unseenSnapshotTimestamp !== undefined && meta.messageTimestamp === undefined) ||
+        (this.lastSnapshotTimestamp !== undefined &&
+          meta.messageTimestamp !== undefined &&
+          meta.messageTimestamp < this.lastSnapshotTimestamp);
       if (!superseded) {
         this.replaceShadow(payload);
         this.advanceSnapshotFloor(meta.messageTimestamp);
+        if (this.unseenSnapshotTimestamp !== undefined && meta.messageTimestamp !== undefined &&
+          meta.messageTimestamp >= this.unseenSnapshotTimestamp) this.unseenSnapshotTimestamp = undefined;
       }
       return outcome;
     }
 
     const staleBelowSnapshot =
-      this.lastSnapshotTimestamp !== undefined &&
-      meta.messageTimestamp !== undefined &&
-      meta.messageTimestamp <= this.lastSnapshotTimestamp;
+      (this.unseenSnapshotTimestamp !== undefined && meta.messageTimestamp === undefined) ||
+      (this.lastSnapshotTimestamp !== undefined &&
+        meta.messageTimestamp !== undefined &&
+        meta.messageTimestamp <= this.lastSnapshotTimestamp);
     if (!staleBelowSnapshot) {
       this.engine.applyDelta(this.shadow, payload);
       this.distinctDeltaIds.add(meta.recordId ?? `synthetic:${++syntheticIdCounter}`);
@@ -338,7 +344,7 @@ export class CollabDoc<TDoc = unknown> {
         lastFlushedStateVector: this.engine.encodeStateVector(this.shadow),
         distinctDeltasSinceSnapshot: this.distinctDeltaIds,
         lastSnapshotBytes: this.lastSnapshotBytes,
-        canSnapshot: options.canSnapshot,
+        canSnapshot: this.unseenSnapshotTimestamp === undefined ? options.canSnapshot : false,
       },
       this.policy,
     );
@@ -391,10 +397,19 @@ export class CollabDoc<TDoc = unknown> {
    * after a write rejection or after applying a foreign snapshot. The newest
    * observed or acknowledged snapshot is used as the timestamp floor. Pass an
    * explicit `afterSquashTs` only when a rejection reports a newer floor, and
-   * stamp the returned `messageTimestamp` on the fresh record.
+   * stamp the returned `messageTimestamp` on the fresh record. An unseen newer
+   * floor invalidates the old durable shadow: recovery includes all known
+   * dependencies, and compaction waits until that snapshot's contents arrive.
    */
   planRepublish(options: RepublishOptions = {}): RepublishResult | null {
     this.assertAlive();
+    if (options.afterSquashTs !== undefined &&
+      (this.lastSnapshotTimestamp === undefined || options.afterSquashTs > this.lastSnapshotTimestamp)) {
+      addMicrosecondTick(options.afterSquashTs);
+      this.replaceShadow();
+      this.lastSnapshotTimestamp = options.afterSquashTs;
+      this.unseenSnapshotTimestamp = options.afterSquashTs;
+    }
     if (this.isDurablyConverged()) return null;
     return computeRepublish(this.engine, this.live, this.engine.encodeStateVector(this.shadow), {
       ...options,
@@ -423,9 +438,10 @@ export class CollabDoc<TDoc = unknown> {
 
   private supersededCommit(messageTimestamp: string | undefined): FlushCommitResult | undefined {
     if (
-      messageTimestamp === undefined ||
       this.lastSnapshotTimestamp === undefined ||
-      messageTimestamp > this.lastSnapshotTimestamp
+      (messageTimestamp === undefined
+        ? this.unseenSnapshotTimestamp === undefined
+        : messageTimestamp > this.lastSnapshotTimestamp)
     ) {
       return undefined;
     }
@@ -436,12 +452,12 @@ export class CollabDoc<TDoc = unknown> {
     };
   }
 
-  private replaceShadow(snapshotPayload: Uint8Array): void {
+  private replaceShadow(snapshotPayload?: Uint8Array): void {
     this.engine.destroyDoc?.(this.shadow);
     this.shadow = this.engine.createDoc();
-    this.engine.applyDelta(this.shadow, snapshotPayload);
+    if (snapshotPayload !== undefined) this.engine.applyDelta(this.shadow, snapshotPayload);
     this.distinctDeltaIds.clear();
-    this.lastSnapshotBytes = snapshotPayload.byteLength;
+    this.lastSnapshotBytes = snapshotPayload?.byteLength ?? 0;
   }
 
   // -------------------------------------------------------------------------

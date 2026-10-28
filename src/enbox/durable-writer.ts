@@ -2,10 +2,10 @@ import type { CollabDoc, DurableDeltaMeta, FlushCommitResult } from '../collab-d
 import type { FlushPlan } from '../plan.js';
 import type { DeltaWriteStatus, RepublishResult, WriteClass } from './index.js';
 
-import { classifyWriteResult, squashFloorTimestamp } from './index.js';
+import { addMicrosecondTick, classifyWriteResult, squashFloorTimestamp } from './index.js';
 
 type PersistenceDocument = Pick<CollabDoc,
-  'applyDurable' | 'planFlush' | 'planRepublish' | 'commitFlush' | 'commitRepublish' | 'hasUnflushedChanges'>;
+  'applyDurable' | 'planFlush' | 'planRepublish' | 'commitFlush' | 'commitRepublish' | 'hasUnflushedChanges' | 'encodeFullState'>;
 
 /** Native create fields for a durable CRDT record. Data is an enveloped collaborative frame. */
 export interface DurableWriteRequest {
@@ -72,7 +72,14 @@ function classifyFailure(error: unknown): WriteClass {
 
 function failureFloor(error: unknown): string | undefined {
   const status = failureStatus(error);
-  return status === undefined ? undefined : squashFloorTimestamp(status);
+  const floor = status === undefined ? undefined : squashFloorTimestamp(status);
+  if (floor === undefined) return undefined;
+  try { addMicrosecondTick(floor); return floor; } catch { return undefined; }
+}
+
+/** Product notifications cannot change persistence outcomes or leak asynchronous rejections. */
+function notify(callback: () => void): void {
+  try { void Promise.resolve(callback()).catch(() => {}); } catch { /* Preserve the write's outcome. */ }
 }
 
 /** Serialize durable writes and convergence for one collaborative document; the caller owns document disposal. */
@@ -90,6 +97,7 @@ export class DurableWriter {
   private flushPending = false;
   private activeWrite: Promise<WriteOutcome | undefined> | undefined;
   private pendingBackstopTs: string | undefined;
+  private unverifiableBackstop: { error: unknown } | undefined;
 
   public constructor(deps: DurableWriterOptions) {
     this.deps = deps;
@@ -111,7 +119,7 @@ export class DurableWriter {
 
   /** Arm the idle debounce and sustained-typing backstop. */
   public onLocalChange(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.unverifiableBackstop !== undefined) return;
     this.flushPending = true;
     this.clock.clearTimeout(this.idleHandle);
     this.idleHandle = this.clock.setTimeout(() => {
@@ -124,9 +132,10 @@ export class DurableWriter {
     }
   }
 
-  /** Capture the CRDT operations not yet present in the durable-state shadow. */
+  /** Capture pending operations; an unusable backstop floor returns full known state for reconstruction and repair. */
   public capturePendingUpdate(): Uint8Array | undefined {
     if (this.disposed) return undefined;
+    if (this.unverifiableBackstop !== undefined) return this.doc.encodeFullState();
     return this.doc.planRepublish()?.delta;
   }
 
@@ -136,7 +145,7 @@ export class DurableWriter {
    * fresh attempt. Edits made after that fresh plan retain their own debounce.
    */
   public async flush(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.unverifiableBackstop !== undefined) return;
     const joined = this.activeWrite;
     if (joined !== undefined) {
       const result = await joined;
@@ -152,6 +161,7 @@ export class DurableWriter {
     this.cancelFlushTimers();
     this.flushPending = false;
     for (;;) {
+      if (this.unverifiableBackstop !== undefined) throw this.unverifiableBackstop.error;
       let attempt = this.activeWrite;
       if (attempt === undefined) {
         if (this.disposed || !this.doc.hasUnflushedChanges()) return;
@@ -234,15 +244,20 @@ export class DurableWriter {
       return result;
     }
     if (classification === 'backstop') {
-      return this.republishOnce(failureFloor(result.error));
+      const floor = failureFloor(result.error);
+      if (floor === undefined) {
+        this.rejectUnverifiableBackstop(result.error);
+        return result;
+      }
+      return this.republishOnce(floor);
     }
-    this.deps.onError?.(result.error);
+    notify(() => this.deps.onError?.(result.error));
     return result;
   }
 
   /** Make one fresh residual attempt beyond a known squash floor. */
   private async republishOnce(
-    squashTimestamp: string | undefined,
+    squashTimestamp: string,
   ): Promise<WriteOutcome | undefined> {
     this.rememberBackstop(squashTimestamp);
     const republish = this.doc.planRepublish({
@@ -264,13 +279,14 @@ export class DurableWriter {
     if (this.disposed) return;
     const outcome = this.doc.applyDurable(frame, meta);
     if (!outcome.applied) {
-      this.deps.onError?.(new Error(`Unable to apply collaborative delta: ${outcome.reason}`));
+      notify(() => this.deps.onError?.(new Error(`Unable to apply collaborative delta: ${outcome.reason}`)));
       return;
     }
     if (outcome.advanced || meta.snapshot === true) this.armConvergence();
   }
 
   private armConvergence(): void {
+    if (this.unverifiableBackstop !== undefined) return;
     this.clock.clearTimeout(this.convergenceHandle);
     this.convergenceHandle = this.clock.setTimeout(() => {
       this.convergenceRepublish();
@@ -279,14 +295,14 @@ export class DurableWriter {
 
   /** Best-effort trailing residual publish after a durable event burst. */
   private convergenceRepublish(): void {
-    if (this.disposed || this.flushPending || this.activeWrite !== undefined) return;
+    if (this.disposed || this.unverifiableBackstop !== undefined || this.flushPending || this.activeWrite !== undefined) return;
     void this.startRepublish(false);
   }
 
-  /** Guaranteed post-recovery residual publish before a caller permits further edits. */
+  /** Attempt an immediate residual publish after local recovery. */
   public async republishNow(): Promise<boolean> {
     for (;;) {
-      if (this.disposed) return false;
+      if (this.disposed || this.unverifiableBackstop !== undefined) return false;
       const joined = this.activeWrite;
       if (joined === undefined) break;
       await joined;
@@ -335,10 +351,14 @@ export class DurableWriter {
     if (classification === 'parent-gone') {
       this.tearDownGone();
     } else if (classification === 'backstop') {
-      this.rememberBackstop(failureFloor(result.error));
-      if (retryBackstop) this.armConvergence();
+      const floor = failureFloor(result.error);
+      if (floor === undefined) this.rejectUnverifiableBackstop(result.error);
+      else {
+        this.rememberBackstop(floor);
+        if (retryBackstop) this.armConvergence();
+      }
     } else {
-      this.deps.onError?.(result.error);
+      notify(() => this.deps.onError?.(result.error));
     }
     return false;
   }
@@ -382,20 +402,26 @@ export class DurableWriter {
     return false;
   }
 
-  private rememberBackstop(timestamp: string | undefined): void {
-    if (
-      timestamp !== undefined &&
-      (this.pendingBackstopTs === undefined || timestamp > this.pendingBackstopTs)
-    ) {
+  private rememberBackstop(timestamp: string): void {
+    if (this.pendingBackstopTs === undefined || timestamp > this.pendingBackstopTs) {
       this.pendingBackstopTs = timestamp;
+      // Update durability knowledge even if this attempt ends before another plan is requested.
+      this.doc.planRepublish({ afterSquashTs: timestamp, nowMillis: this.clock.now() });
     }
+  }
+
+  private rejectUnverifiableBackstop(error: unknown): void {
+    // Rehydration must establish the storage head before this writer can promise durability again.
+    this.unverifiableBackstop = { error };
+    this.cancelAllTimers();
+    notify(() => this.deps.onError?.(error));
   }
 
   private tearDownGone(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.cancelAllTimers();
-    this.deps.onParentGone?.();
+    notify(() => this.deps.onParentGone?.());
   }
 
   /** Stop scheduling and ignore late acknowledgements without persisting or destroying the document. */
