@@ -140,7 +140,7 @@ export class DurableWriter {
   }
 
   /**
-   * Persist the state present when this call can obtain the serialized writer.
+   * Best-effort persistence reports native failures through onError; use drain() for a strict barrier.
    * A caller arriving during an older write joins it, then starts at most one
    * fresh attempt. Edits made after that fresh plan retain their own debounce.
    */
@@ -411,7 +411,7 @@ export class DurableWriter {
   }
 
   private rejectUnverifiableBackstop(error: unknown): void {
-    // Rehydration must establish the storage head before this writer can promise durability again.
+    // The caller must capture repair state, authoritatively rehydrate, and construct a replacement writer.
     this.unverifiableBackstop = { error };
     this.cancelAllTimers();
     notify(() => this.deps.onError?.(error));
