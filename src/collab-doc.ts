@@ -98,7 +98,8 @@ function latestTimestamp(a: string | undefined, b: string | undefined): string |
  *
  * Threading model: single writer loop per document — serialize
  * {@link planFlush}/{@link commitFlush} pairs (do not interleave concurrent
- * flushes of the same document).
+ * flushes of the same document). `DurableWriter` from `@enbox/crdt/enbox`
+ * owns that scheduling and commit sequence for standard Enbox persistence.
  */
 export class CollabDoc<TDoc = unknown> {
   private readonly engine: DocEngine<TDoc>;
