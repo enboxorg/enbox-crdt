@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { DocumentNotReadyError, DocumentSessions, PendingDocumentChangesError } from '../enbox/index.js';
+import { DocumentNotReadyError, DocumentSessions, DocumentWriterDisposedError, PendingDocumentChangesError, PARENT_RECORD_NOT_FOUND_ERROR_CODE } from '../enbox/index.js';
 import type { DocumentPersistence, DurableDocumentUpdate, OpenDocumentSessionOptions } from '../enbox/index.js';
 import { encodeEnvelope } from '../index.js';
 import { createYjs1Doc } from '../yjs1/index.js';
@@ -28,15 +28,16 @@ function update(text: string): DurableDocumentUpdate {
 function fixture() {
   const create = vi.fn<OpenDocumentSessionOptions<Document>['create']>(async () => ({ id: 'written', timestamp }));
   const onError = vi.fn();
+  const onParentGone = vi.fn();
   const onLifecycle = vi.fn();
   const createDocument = vi.fn(() => {
     const doc = createYjs1Doc();
     return { doc, awareness: createAwareness(doc) };
   });
-  const sessions = new DocumentSessions({ createDocument, timers, onError, onLifecycle });
+  const sessions = new DocumentSessions({ createDocument, timers, onError, onLifecycle, onParentGone });
   const open = (options: Partial<OpenDocumentSessionOptions<Document>> = {}) =>
     sessions.open('page', { create, writable: true, canSquash: false, ...options });
-  return { sessions, createDocument, create, onError, onLifecycle, open };
+  return { sessions, createDocument, create, onError, onLifecycle, onParentGone, open };
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -181,6 +182,35 @@ describe('document ownership', () => {
 });
 
 describe('document recovery', () => {
+  it.each([false, true])('retains recovery state if its writer stops before readiness with writable=%s', async writable => {
+    const test = fixture();
+    const synced = deferred<void>();
+    const persistence = vi.fn((doc: Document) => {
+      doc.insertText(0, 'recovered cache');
+      return { whenSynced: synced.promise, destroy: vi.fn() };
+    });
+    const opening = test.open({ writable, persistence });
+    const rejected = expect(opening).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+    try {
+      await vi.waitFor(() => expect(persistence).toHaveBeenCalledOnce());
+      const session = test.sessions.get('page')!;
+      session.writer.dispose();
+      synced.resolve();
+      await rejected;
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('recovered cache');
+      expect(test.sessions.hasPending()).toBe(true);
+      expect(test.sessions.capturePending()).toHaveLength(1);
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      expect(test.create).not.toHaveBeenCalled();
+      expect(test.onLifecycle).not.toHaveBeenCalled();
+    } finally {
+      synced.resolve();
+      await opening.catch(() => {});
+      await test.sessions.dispose();
+    }
+  });
+
   it.each(['pending', 'failed'] as const)('captures readonly local edits while recovery is %s without capturing live traffic alone', async state => {
     const test = fixture();
     const synced = deferred<void>();
@@ -426,6 +456,119 @@ describe('document recovery', () => {
 });
 
 describe('document authority and repair', () => {
+  it.each([
+    ['manual disposal', true], ['manual disposal', false],
+    ['parent gone', true], ['parent gone', false],
+  ] as const)('retains stopped-writer changes after %s with writable=%s until explicit handoff', async (cause, writable) => {
+    const test = fixture();
+    const fresh = fixture();
+    const handoff = createYjs1Doc();
+    const accepted = deferred<{ id: string; timestamp: string }>();
+    const failure = Object.assign(new Error('parent gone'), {
+      status: { code: 400, errorCode: PARENT_RECORD_NOT_FOUND_ERROR_CODE },
+    });
+    let stopping: Promise<void> | undefined;
+    try {
+      const session = await test.open({
+        writable: cause === 'parent gone' || writable,
+        updates: [update('durable baseline')],
+      });
+      session.doc.insertText(session.doc.getText().length, ' retained');
+      if (cause === 'parent gone') {
+        test.create.mockImplementationOnce(() => accepted.promise);
+        stopping = session.writer.drain();
+        const rejected = expect(stopping).rejects.toBe(failure);
+        await vi.waitFor(() => expect(test.create).toHaveBeenCalledOnce());
+        if (!writable) await test.open({ writable: false });
+        accepted.reject(failure);
+        await rejected;
+        expect(test.onParentGone).toHaveBeenCalledExactlyOnceWith('page');
+      } else {
+        session.writer.dispose();
+        expect(test.onParentGone).not.toHaveBeenCalled();
+      }
+      expect(session.writer.isDisposed).toBe(true);
+      session.doc.insertText(session.doc.getText().length, ' after stop');
+      expect(test.sessions.hasPending()).toBe(true);
+      const captured = test.sessions.capturePending();
+      expect(captured).toHaveLength(1);
+      expect(handoff.applyLive(captured[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toBe('durable baseline retained after stop');
+      await expect(test.sessions.drain('page')).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      await expect(test.open({ writable })).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      expect(test.sessions.get('page')).toBe(session);
+      await session.writer.flush();
+      expect(test.create).toHaveBeenCalledTimes(cause === 'parent gone' ? 1 : 0);
+      fresh.sessions.stage('page', captured[0]!.update);
+      const recovered = await fresh.open();
+      await fresh.sessions.drainAll();
+      expect(recovered.doc.getText()).toBe('durable baseline retained after stop');
+      expect(fresh.sessions.hasPending()).toBe(false);
+      await test.sessions.discard('page');
+      expect(test.sessions.get('page')).toBeUndefined();
+      expect(test.sessions.hasPending()).toBe(false);
+    } finally {
+      if (stopping !== undefined) {
+        accepted.reject(failure);
+        await stopping.catch(() => {});
+      }
+      handoff.destroy();
+      await Promise.all([test.sessions.dispose(), fresh.sessions.dispose()]);
+    }
+  });
+
+  it.each(['clean', 'readonly live-only'] as const)('can close a stopped %s document without inventing pending edits', async state => {
+    const test = fixture();
+    try {
+      const writable = state === 'clean';
+      const session = await test.open({ writable, updates: writable ? [update('durable')] : [] });
+      if (!writable) session.doc.applyLive(update('ephemeral peer').data);
+      session.writer.dispose();
+      expect(test.sessions.hasPending()).toBe(false);
+      expect(test.sessions.capturePending()).toEqual([]);
+      await expect(test.open({ writable })).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      await test.sessions.close('page');
+      expect(test.sessions.get('page')).toBeUndefined();
+      expect(test.create).not.toHaveBeenCalled();
+    } finally {
+      await test.sessions.dispose();
+    }
+  });
+
+  it('exports the durable baseline with an unapplied incremental repair after its writer stops', async () => {
+    const test = fixture();
+    const source = createYjs1Doc();
+    const handoff = createYjs1Doc();
+    try {
+      const baseline = update('durable baseline');
+      source.applyDurable(baseline.data);
+      source.insertText(source.getText().length, ' + repair');
+      const repair = source.planFlush({ canSnapshot: false });
+      if (repair.kind === 'noop') throw new Error('Missing incremental repair');
+      const session = await test.open({ updates: [baseline] });
+      expect(session.doc.hasUnflushedChanges()).toBe(false);
+      session.writer.dispose();
+      test.sessions.stage('page', repair.delta);
+      const captured = test.sessions.capturePending();
+      expect(captured).toHaveLength(1);
+      expect(handoff.applyLive(captured[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toBe('durable baseline + repair');
+      expect(session.doc.getText()).toBe('durable baseline');
+      expect(session.doc.hasUnflushedChanges()).toBe(false);
+      expect(test.sessions.hasPending()).toBe(true);
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(DocumentWriterDisposedError);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(test.create).not.toHaveBeenCalled();
+    } finally {
+      source.destroy();
+      handoff.destroy();
+      await test.sessions.dispose();
+    }
+  });
+
   it('returns a rejected open promise when demotion capture fails and still denies readonly writes', async () => {
     const test = fixture();
     try {
@@ -561,11 +704,12 @@ describe('document authority and repair', () => {
     }
   });
 
-  it('retains pending edits through demotion without writing, then uses fresh authority after rebind', async () => {
+  it.each(['local', 'live'] as const)('retains a writable %s residual through demotion, then uses fresh authority after rebind', async origin => {
     vi.useFakeTimers();
     const test = fixture();
     const session = await test.open();
-    session.doc.insertText(0, 'edit');
+    if (origin === 'local') session.doc.insertText(0, 'edit');
+    else session.doc.applyLive(update('edit').data);
     await test.open({ writable: false });
     await vi.advanceTimersByTimeAsync(200);
     await test.sessions.flush('page');
@@ -586,7 +730,10 @@ describe('document authority and repair', () => {
     const session = await test.open({ writable: false });
     session.doc.applyLive(update('remote live').data);
     await test.open({ writable: false });
+    const capture = vi.spyOn(session.writer, 'capturePendingUpdate');
     expect(test.sessions.hasPending()).toBe(false);
+    expect(test.sessions.capturePending()).toEqual([]);
+    expect(capture).not.toHaveBeenCalled();
     await test.sessions.drainAll();
     await test.sessions.close('page');
     expect(test.create).not.toHaveBeenCalled();
@@ -654,12 +801,14 @@ describe('document authority and repair', () => {
     try {
       const session = await test.open({ writable: false });
       test.sessions.stage('page', update('staged repair').data);
+      session.doc.applyLive(update('peer live').data);
       session.doc.insertText(0, 'new local');
       const captured = test.sessions.capturePending();
       expect(captured).toHaveLength(1);
       expect(handoff.applyLive(captured[0]!.update).applied).toBe(true);
       expect(handoff.getText()).toContain('staged repair');
       expect(handoff.getText()).toContain('new local');
+      expect(handoff.getText()).toContain('peer live');
       await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
       expect(test.sessions.get('page')).toBe(session);
       const create = vi.fn<OpenDocumentSessionOptions<Document>['create']>(async request => {
@@ -672,6 +821,7 @@ describe('document authority and repair', () => {
       expect(create).toHaveBeenCalledOnce();
       expect(persisted.getText()).toContain('staged repair');
       expect(persisted.getText()).toContain('new local');
+      expect(persisted.getText()).toContain('peer live');
       expect(test.sessions.hasPending()).toBe(false);
     } finally {
       handoff.destroy();

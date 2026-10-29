@@ -194,7 +194,7 @@ function formatEpochMicros(epochMicros: bigint): string {
 
 export { DurableWriter } from './durable-writer.js';
 export type { DurableWriterOptions, DurableWriterTimers, DurableWriterClock, DurableWriteRequest, DurableWriteRecord } from './durable-writer.js';
-export { DocumentSessions, DocumentNotReadyError, PendingDocumentChangesError } from './document-sessions.js';
+export { DocumentSessions, DocumentNotReadyError, DocumentWriterDisposedError, PendingDocumentChangesError } from './document-sessions.js';
 export type {
   DocumentLifecycleEvent, DocumentPersistence, DocumentSession, DocumentSessionsOptions,
   DurableDocumentUpdate, OpenDocumentSessionOptions,

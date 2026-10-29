@@ -19,7 +19,7 @@ export interface DocumentPersistence {
   clearData?(): void | Promise<void>;
 }
 
-/** One stable document, writer and document-lifetime awareness handle. */
+/** One stable document, writer and awareness handle; use the owner for lifetime operations. */
 export interface DocumentSession<Document extends CollabDoc, Awareness extends { destroy(): void }> {
   readonly doc: Document;
   readonly writer: DurableWriter;
@@ -64,7 +64,7 @@ export interface DocumentSessionsOptions<Document extends CollabDoc, Awareness e
   onParentGone?(key: string): void;
 }
 
-/** Pending authored or recovered changes cannot be saved without writable access. */
+/** Retained pending changes cannot be saved without writable access. */
 export class PendingDocumentChangesError extends Error {
   constructor() {
     super('Pending document changes require writable access before they can be saved.');
@@ -80,6 +80,14 @@ export class DocumentNotReadyError extends Error {
   }
 }
 
+/** A stopped writer cannot be reused or certify that pending changes were saved. */
+export class DocumentWriterDisposedError extends Error {
+  constructor() {
+    super('Document writer is disposed. Capture pending changes, then discard and open a fresh session.');
+    this.name = 'DocumentWriterDisposedError';
+  }
+}
+
 type Binding = Pick<OpenDocumentSessionOptions<CollabDoc>, 'create' | 'writable' | 'canSquash'>;
 type CloseAttempt = { promise: Promise<void> };
 type Entry<Document extends CollabDoc, Awareness extends { destroy(): void }> = {
@@ -91,7 +99,8 @@ type Entry<Document extends CollabDoc, Awareness extends { destroy(): void }> = 
   published: boolean;
   retired: boolean;
   suspended: boolean;
-  localChanges: boolean;
+  /** Local/cache edits or pending work retained when writable authority was lost. */
+  retainResidual: boolean;
   tail: Promise<void>;
   closing?: CloseAttempt;
   detachLocal?: () => void;
@@ -139,15 +148,17 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
    * hydration is pending. A missing persistence option never detaches an existing adapter.
    * Authority changes take effect at invocation; queued setup uses the latest binding.
    * Every failure rejects the returned promise, including synchronous preparation errors.
+   * A stopped writer rejects with DocumentWriterDisposedError and needs explicit recreation.
    */
   async open(key: string, options: OpenDocumentSessionOptions<Document>): Promise<DocumentSession<Document, Awareness>> {
     if (this.disposed) throw retiredError();
     const binding: Binding = { create: options.create, writable: options.writable, canSquash: options.canSquash };
     let entry = this.entries.get(key);
+    if (entry !== undefined) this.assertWriterActive(entry);
     if (entry === undefined) {
       entry = {
         key, abort: new AbortController(), binding, initialized: false,
-        published: false, retired: false, suspended: true, localChanges: false,
+        published: false, retired: false, suspended: true, retainResidual: false,
         tail: Promise.resolve(), recovered: false,
       };
       this.entries.set(key, entry);
@@ -156,7 +167,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     const wasWritable = owned.binding.writable;
     owned.binding = binding;
     if (wasWritable && !binding.writable && owned.session?.writer.capturePendingUpdate() !== undefined) {
-      owned.localChanges = true;
+      owned.retainResidual = true;
     }
     const previousClose = owned.closing;
     owned.closing = undefined;
@@ -167,10 +178,10 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     }
     const opening = owned.tail.then(async () => {
       try {
-        this.assertCurrent(owned);
+        this.assertWriterActive(owned);
         if (!owned.initialized) await this.initialize(owned, options.load, options.updates);
         else for (const { data, ...meta } of options.updates ?? []) owned.session!.writer.applyDurable(data, meta);
-        this.assertCurrent(owned);
+        this.assertWriterActive(owned);
         // A queued request can replace a failed attachment, never a successful one.
         if (options.persistence !== undefined && !owned.recovered && owned.persistencePending === undefined) {
           owned.persistenceFactory = options.persistence;
@@ -183,12 +194,12 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
         } else {
           owned.suspended = false;
         }
-        this.assertCurrent(owned);
+        this.assertWriterActive(owned);
         if (!owned.published || previousClose !== undefined) {
           owned.published = true;
           this.emit(owned, 'opened');
         }
-        this.assertCurrent(owned);
+        this.assertWriterActive(owned);
         return owned.session!;
       } catch (error) {
         // Do not erase valid local state or repair bytes when setup cannot finish.
@@ -229,7 +240,8 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   /**
    * Join opening work, drain and dispose. Unconfirmed read-only local/repair changes
    * reject with PendingDocumentChangesError; incomplete recovery rejects with
-   * DocumentNotReadyError. Failures before retirement retain the exact handle for
+   * DocumentNotReadyError. A stopped writer with pending work rejects with
+   * DocumentWriterDisposedError. Failures before retirement retain the exact handle for
    * retry; adapter cleanup can reject after ownership is already fenced. An
    * intervening open reclaims the handle and fences this close's finalizer.
    */
@@ -242,7 +254,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     const opening = entry.tail;
     attempt.promise = opening.then(async () => {
       if (!this.isCurrent(entry) || entry.closing !== attempt) return;
-      if (!entry.initialized || entry.suspended) throw new DocumentNotReadyError();
+      this.assertDrainReady(entry);
       this.emit(entry, 'closing');
       if (!this.isCurrent(entry) || entry.closing !== attempt) return;
       await this.drainReady(entry);
@@ -285,13 +297,19 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     return this.disposal;
   }
 
-  /** Copy writable/local residuals and staged repairs, including incomplete recovery. */
+  /**
+   * Copy whole writable/local residuals and staged repairs, including stopped writers.
+   * Encoding/combination failures throw without discarding retained edits.
+   */
   capturePending(): Array<{ key: string; update: Uint8Array }> {
     for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
     const pending = new Map(this.staged);
     for (const entry of this.entries.values()) {
-      if (entry.binding.writable || entry.localChanges || pending.has(entry.key)) {
-        const update = entry.session?.writer.capturePendingUpdate();
+      if (entry.binding.writable || entry.retainResidual || pending.has(entry.key)) {
+        const session = entry.session;
+        const update = session?.writer.isDisposed && pending.has(entry.key)
+          ? session.doc.encodeFullState()
+          : session?.writer.capturePendingUpdate();
         if (update !== undefined) {
           const staged = pending.get(entry.key);
           pending.set(entry.key, staged !== undefined && staged !== entry.appliedStage
@@ -325,7 +343,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
     if (this.staged.size > 0) return true;
     for (const entry of this.entries.values()) {
-      if ((entry.binding.writable || entry.localChanges) && entry.session?.writer.capturePendingUpdate() !== undefined) return true;
+      if ((entry.binding.writable || entry.retainResidual) && entry.session?.writer.capturePendingUpdate() !== undefined) return true;
     }
     return false;
   }
@@ -340,7 +358,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
       const writer = new DurableWriter({
         doc, timers: this.options.timers, clock: this.options.clock, canSquash: entry.binding.canSquash,
         create: request => {
-          this.assertCurrent(entry);
+          this.assertWriterActive(entry);
           if (entry.suspended) throw new DocumentNotReadyError();
           if (!entry.binding.writable) throw new PendingDocumentChangesError();
           return entry.binding.create(request);
@@ -367,12 +385,13 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
 
   private async recover(entry: Entry<Document, Awareness>): Promise<void> {
     const session = entry.session!;
+    this.assertWriterActive(entry);
     entry.suspended = true;
     // Settle an issued write; the dispatch guard prevents another write before recovery.
     await session.writer.flush();
-    this.assertCurrent(entry);
+    this.assertWriterActive(entry);
     entry.persistencePending ??= Promise.resolve().then(() => {
-      this.assertCurrent(entry);
+      this.assertWriterActive(entry);
       return entry.persistenceFactory!(session.doc, entry.abort.signal);
     }).then(persistence => {
       // A late adapter still owns readiness even if its open caller was already aborted.
@@ -382,7 +401,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     try {
       const persistence = await this.wait(entry, entry.persistencePending);
       entry.persistence = persistence;
-      this.assertCurrent(entry);
+      this.assertWriterActive(entry);
       await this.wait(entry, persistence.whenSynced);
     } catch (error) {
       if (this.isCurrent(entry)) {
@@ -393,11 +412,11 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
       }
       throw error;
     }
-    this.assertCurrent(entry);
+    this.assertWriterActive(entry);
     entry.suspended = false;
     try {
       if (entry.binding.writable) await session.writer.drain();
-      this.assertCurrent(entry);
+      this.assertWriterActive(entry);
       entry.recovered = true;
     } catch (error) {
       entry.suspended = true;
@@ -417,7 +436,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     const result = entry.session!.doc.applyLive(update);
     if (!result.applied) throw new Error(`Unable to restore document changes: ${result.reason}`);
     entry.appliedStage = update;
-    entry.localChanges = true;
+    entry.retainResidual = true;
     if (entry.binding.writable) {
       this.staged.delete(entry.key);
       entry.appliedStage = undefined;
@@ -426,9 +445,10 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   }
 
   private clearConfirmedStage(entry: Entry<Document, Awareness>): void {
-    if (this.isCurrent(entry) && entry.session !== undefined && !entry.session.writer.isDisposed
+    if (!entry.retainResidual && entry.appliedStage === undefined) return;
+    if (this.isCurrent(entry) && entry.session !== undefined
       && entry.session.writer.capturePendingUpdate() === undefined) {
-      entry.localChanges = false;
+      entry.retainResidual = false;
       if (entry.appliedStage !== undefined && entry.appliedStage === this.staged.get(entry.key)) {
         this.staged.delete(entry.key);
         entry.appliedStage = undefined;
@@ -439,7 +459,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   private attachLocal(entry: Entry<Document, Awareness>): void {
     entry.detachLocal ??= entry.session!.doc.onLocalUpdate(() => {
       if (!this.isCurrent(entry)) return;
-      entry.localChanges = true;
+      entry.retainResidual = true;
       if (entry.binding.writable && !entry.suspended) entry.session!.writer.onLocalChange();
     });
   }
@@ -452,14 +472,27 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   /** Shared barrier after setup; close already joined its captured opening work. */
   private async drainReady(entry: Entry<Document, Awareness>): Promise<void> {
     if (!this.isCurrent(entry)) return;
-    if (entry.suspended) throw new DocumentNotReadyError();
-    if (entry.binding.writable) await entry.session?.writer.drain();
+    this.assertDrainReady(entry);
+    if (entry.binding.writable && !entry.session!.writer.isDisposed) await entry.session!.writer.drain();
     if (!this.isCurrent(entry)) return;
-    if (entry.suspended) throw new DocumentNotReadyError();
-    this.clearConfirmedStage(entry);
-    if (this.staged.has(entry.key) || (!entry.binding.writable && entry.localChanges)) {
+    this.assertDrainReady(entry);
+    if (this.staged.has(entry.key) || (!entry.binding.writable && entry.retainResidual)) {
       throw new PendingDocumentChangesError();
     }
+  }
+
+  private assertDrainReady(entry: Entry<Document, Awareness>): void {
+    this.clearConfirmedStage(entry);
+    if (entry.session?.writer.isDisposed && (entry.suspended || this.staged.has(entry.key)
+      || ((entry.binding.writable || entry.retainResidual) && entry.session.writer.capturePendingUpdate() !== undefined))) {
+      throw new DocumentWriterDisposedError();
+    }
+    if (!entry.initialized || entry.suspended) throw new DocumentNotReadyError();
+  }
+
+  private assertWriterActive(entry: Entry<Document, Awareness>): void {
+    this.assertCurrent(entry);
+    if (entry.session?.writer.isDisposed) throw new DocumentWriterDisposedError();
   }
 
   /** Validate or combine repairs without mutating the retained live document. */

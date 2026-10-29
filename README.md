@@ -122,8 +122,11 @@ Call
 `stage(key, update)` on a fresh owner before opening with new authority. It
 validates the whole frame with a temporary document before retaining it, so a
 malformed frame cannot replace a valid repair or poison the retained document.
-Staged changes survive read-only access. Demoting a writable document also
-retains its pending changes.
+Staged changes survive read-only access. Recovery captures the whole state beyond
+the durable shadow, not only operations authored by this client: peer live edits
+can ride along once a document has local changes or a staged repair. Demotion
+also retains the former writable document's residual, even if it contains only
+peer live edits. This preserves the existing healing policy.
 
 The factory must create a fresh empty in-memory document. Temporary documents
 also combine an unapplied repair and live residual during capture, without
@@ -131,15 +134,30 @@ mutating the retained document. If applying a validated repair to the live
 document nevertheless fails, `open` rejects and pauses writes; it preserves both
 the document and repair for capture and retry. It never clears recovery data to
 hide that failure. All `open` failures reject its returned promise.
+Encoding or combining recovery frames can make `capturePending()` throw; a
+failed export does not discard retained edits. An unapplied staged repair stays
+pending until `open` merges it against the hydrated document or the host discards it.
 
 `writable: false` controls native write dispatch; it does not make the exposed
 `CollabDoc` immutable. If application code edits that document, its local-update
 feed retains the changes without writing. Close and durability barriers reject
 with `PendingDocumentChangesError` until the changes are confirmed, writable
-authority is restored, or the host explicitly discards them. Ordinary read-only
-`applyLive` traffic is not staged. `DocumentNotReadyError` instead means hydration
+authority is restored, or the host explicitly discards them. An always-read-only
+document with only `applyLive` traffic has no pending write obligation.
+`DocumentNotReadyError` instead means hydration
 or recovery has not completed successfully; retry `open` before draining. These
 public errors also cover authority changes during a pending write/drain.
+
+A writer stopped by a deleted parent or explicit `writer.dispose()` cannot be
+restarted by rebinding. `open` rejects with `DocumentWriterDisposedError`; strict
+drain/close operations reject that error while relevant edits or recovery remain.
+Pending queries and export still inspect the retained document. Dirty stopped
+writers export full state because the old parent may have removed its baseline;
+pure capture requires the document to remain alive and never resumes writing.
+Capture before explicit discard/recreation when those edits must survive. An
+already-ready, clean stopped session can close normally. Applications that
+intentionally retire a deleted page should explicitly discard its session from `onParentGone` after
+detaching their live/editor bindings.
 
 `discard(key)` and `dispose()` explicitly abandon owned state: they fence handles
 and stop scheduling immediately, then await adapter cleanup. Cache data is kept
