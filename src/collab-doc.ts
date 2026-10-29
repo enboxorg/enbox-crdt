@@ -28,7 +28,7 @@ import { bytesEqual } from './bytes.js';
 import { applyEnvelope } from './engine.js';
 import { addMicrosecondTick, computeRepublish, type RepublishOptions, type RepublishResult } from './enbox/index.js';
 import { decodeEnvelope, encodeEnvelope } from './envelope.js';
-import { wireLiveSync, type LiveSyncOptions, type SyncChannel } from './live/index.js';
+import { bindLiveDocument, type LiveChannel, type LiveConnectionOptions } from './live/binding.js';
 import { DEFAULT_SNAPSHOT_POLICY, planFlush, type FlushPlan, type SnapshotPolicy } from './plan.js';
 
 /** Where a text change came from. */
@@ -315,7 +315,7 @@ export class CollabDoc<TDoc = unknown> {
    * every transaction that did NOT come from {@link applyDurable}/
    * {@link applyLive} — local edits (API or editor binding), undo/redo, and
    * unconfirmed changes merged by a local persistence adapter.
-   * Broadcast these over the live channel; coalescing is the transport's job.
+   * connectLive batches these for a channel; custom integrations can subscribe directly.
    */
   onLocalUpdate(listener: (frame: Uint8Array) => void): () => void {
     this.assertAlive();
@@ -466,21 +466,30 @@ export class CollabDoc<TDoc = unknown> {
   // -------------------------------------------------------------------------
 
   /**
-   * Wire state-vector reconciliation onto a channel: probes on connect and on
-   * an interval; answers peers with a conservative diff when needed. Feed
-   * inbound update/heal frames to {@link applyLive} and outbound
-   * {@link onLocalUpdate} frames to the channel — that completes the loop.
-   * Returns a teardown (also run by {@link destroy}).
+   * Attach local-update batching, synchronization, and optional cursors to a channel.
+   * The caller admits incoming document updates/heals through {@link applyLive};
+   * canWrite checks current authority for each incoming sync/cursor frame.
+   * Returns an idempotent detach, also run by destroy. Neither channel nor awareness
+   * ownership transfers; durable writes remain independent of this live attachment.
    */
-  connectLiveSync(channel: SyncChannel, options?: LiveSyncOptions): () => void {
+  connectLive<State extends object = Record<string, unknown>>(
+    channel: LiveChannel,
+    options: LiveConnectionOptions<State>,
+  ): () => void {
     this.assertAlive();
-    const off = wireLiveSync(
+    const off = bindLiveDocument(
       this.engine,
-      channel,
-      () => (this.destroyed ? undefined : this.live),
+      this.live,
+      handler => this.onLocalUpdate(handler),
       () => !this.destroyed,
+      channel,
       options,
     );
+    // A channel callback can synchronously retire the document during attachment.
+    if (this.destroyed) {
+      off();
+      this.assertAlive();
+    }
     return this.registerTeardown(off);
   }
 

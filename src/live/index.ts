@@ -19,6 +19,8 @@
 import type { MergeEngine } from '../engine.js';
 import { encodeEnvelope, tryDecodeEnvelope } from '../envelope.js';
 
+export type { LiveChannel, LiveConnectionOptions } from './binding.js';
+
 /** Default reconciliation cadence: imperceptible heal latency, negligible cost. */
 export const LIVE_SYNC_INTERVAL_MS = 3000;
 
@@ -68,16 +70,19 @@ export function wireLiveSync<TDoc>(
   options: LiveSyncOptions = {},
 ): () => void {
   const intervalMs = options.intervalMs ?? LIVE_SYNC_INTERVAL_MS;
+  let stopped = false;
 
   const probe = (): void => {
+    if (stopped || !isCurrent()) return;
     const doc = getDoc();
-    if (doc === undefined || !isCurrent()) return;
+    if (doc === undefined) return;
     channel.broadcastSync(encodeEnvelope(engine.formatId, engine.encodeStateVector(doc)));
   };
 
   const offSync = channel.onSync((frame) => {
+    if (stopped || !isCurrent()) return;
     const doc = getDoc();
-    if (doc === undefined || !isCurrent()) return;
+    if (doc === undefined) return;
     let envelope;
     try {
       envelope = tryDecodeEnvelope(frame);
@@ -97,31 +102,33 @@ export function wireLiveSync<TDoc>(
   });
 
   let timer: ReturnType<typeof setInterval> | undefined;
-  let stopped = false;
-  const offStatus = channel.onStatus?.((status) => {
-    if (status === 'connected' && !stopped) {
-      // A reconnect can leave us behind by whatever was missed while the
-      // socket was down — reconcile the moment we're back, not a tick later,
-      // and resume the periodic probe if 'closed' had paused it.
-      probe();
-      timer ??= setInterval(probe, intervalMs);
-    }
-    if (status === 'closed' && timer !== undefined) {
-      clearInterval(timer);
-      timer = undefined;
-    }
-  });
-
-  probe(); // heal any gap that predates this wiring
-  timer = setInterval(probe, intervalMs);
-
-  return () => {
+  let offStatus: (() => void) | undefined;
+  const stop = (): void => {
+    if (stopped) return;
     stopped = true;
     if (timer !== undefined) {
       clearInterval(timer);
       timer = undefined;
     }
-    offSync();
-    offStatus?.();
+    try { offSync(); } finally { offStatus?.(); }
   };
+  try {
+    offStatus = channel.onStatus?.((status) => {
+      if (status === 'connected' && !stopped) {
+        // Reconnect probes immediately and resumes periodic reconciliation.
+        probe();
+        if (!stopped && isCurrent()) timer ??= setInterval(probe, intervalMs);
+      }
+      if (status === 'closed' && timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    });
+    probe(); // heal any gap that predates this wiring
+    if (!stopped && isCurrent()) timer ??= setInterval(probe, intervalMs);
+    return stop;
+  } catch (error) {
+    stop();
+    throw error;
+  }
 }

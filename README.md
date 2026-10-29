@@ -310,46 +310,55 @@ snapshot floor. Supply `afterSquashTs` only when a server rejection reports a
 newer floor. Missing or invalid floor metadata requires document reconstruction;
 an old shadow cannot establish which dependencies survived the squash.
 
-## Realtime healing
+## Live collaboration
 
-```ts
-const offUpdates = doc.onLocalUpdate((frame) => {
-  channel.broadcastUpdate(frame);
-});
-const offInbound = channel.onUpdate((frame) => {
-  doc.applyLive(frame);
-});
-const offSync = doc.connectLiveSync(channel);
-
-// Later:
-offSync();
-offInbound();
-offUpdates();
-```
-
-Durable records remain authoritative. Realtime updates reduce latency, while
-periodic state-vector probes heal dropped frames.
-
-## Awareness
+Attach an open document to your encrypted channel with `connectLive()`. Supply
+`canWritePeer` from current verified transport-peer and role records; the binding
+checks it for every incoming sync or cursor frame. Your receive path continues to
+admit document updates, including any permission checks across asynchronous opens.
 
 ```ts
 import { createAwareness } from '@enbox/crdt/yjs1/awareness';
 
 const awareness = createAwareness(doc);
-awareness.setLocalStateField('user', {
-  name: 'Ada',
-  color: '#336699',
+awareness.setLocalStateField('user', { name: 'Ada', color: '#336699' });
+
+const offInbound = channel.onUpdate((frame, peerId) => {
+  if (canWritePeer(peerId)) doc.applyLive(frame);
+});
+const detach = doc.connectLive(channel, {
+  canWrite: canWritePeer,
+  awareness,
 });
 
-const offRemote = channel.onAwareness((update) => {
-  awareness.applyUpdate(update, 'remote');
-});
-const offAwareness = awareness.onUpdate((_change, origin) => {
-  if (origin !== 'remote') {
-    channel.broadcastAwareness(awareness.encodeUpdate([awareness.clientId]));
-  }
-});
+// Later:
+offInbound();
+detach();
 ```
+
+Local edits send immediately, then coalesce over 200 ms; cursor changes coalesce
+over 300 ms. Channel backpressure can lengthen subsequent batches. These delays
+and the 3000 ms sync-probe interval are configurable. Engines without a batch
+merge operation send each queued frame individually. Remote live/durable frames
+do not echo through the local-update feed.
+
+Use `broadcast: false` for a receive-only attachment: it receives admitted cursors
+without sending edits, sync probes, heal replies, or cursor announcements. Omit
+`awareness` for text-only channels. Otherwise the channel must provide both
+`onAwareness` and `broadcastAwareness`.
+
+Detach is idempotent and also runs on document destruction. It releases listeners
+and timers, sends remaining local frames and cursor departure best-effort, clears
+remote cursors, and preserves local cursor state for reattachment. Browsers also
+announce cursor departure on `pagehide`. The application still owns the channel.
+
+Durable writes remain separate: small live batches reduce latency; later DWN
+records confirm the same operations in the durable shadow. Receiving those records
+does not reapply already-merged text. `DocumentSessions` retains document and writer
+ownership. Custom integrations can use the lower-level `wireLiveSync()` primitive
+from `@enbox/crdt/live` for reconciliation alone.
+
+## Awareness
 
 Each document has one awareness lifecycle; repeated `createAwareness()` calls
 return the same handle so its client clock stays monotonic. The handle also
@@ -414,8 +423,9 @@ including after the collaborative document has been destroyed.
 
 ## Framed yjs1 update batching
 
-Batch the frames emitted by `onLocalUpdate()` directly for durable storage or
-realtime transport. Every input must be a valid SDK envelope tagged `yjs1`:
+Custom integrations can batch frames emitted by `onLocalUpdate()` directly.
+`connectLive()` already owns ordinary live batching. Every input to the lower-level
+batch helper must be a valid SDK envelope tagged `yjs1`:
 
 ```ts
 import { mergeYjs1Frames } from '@enbox/crdt/yjs1';
@@ -440,7 +450,7 @@ available through the engine's `mergeDeltas` on `@enbox/crdt/yjs1/advanced`.
 | `@enbox/crdt/yjs1/codemirror` | CodeMirror 6 binding and neutral undo lifecycle |
 | `@enbox/crdt/yjs1/indexeddb` | Browser persistence lifecycle |
 | `@enbox/crdt/enbox` | `DocumentSessions`, durable writers, DWN classification, and squash timestamp helpers |
-| `@enbox/crdt/live` | Transport-agnostic state-vector reconciliation |
+| `@enbox/crdt/live` | Live channel/options types and low-level state-vector reconciliation |
 
 The wire-format contract and conformance fixtures are documented in
 [`SPEC.md`](./SPEC.md).

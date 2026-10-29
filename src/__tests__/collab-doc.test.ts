@@ -444,32 +444,34 @@ describe('CollabDoc — realtime', () => {
     b.destroy();
   });
 
-  it('heals a behind peer via connectLiveSync probes', () => {
+  it('heals a behind peer via connectLive probes', () => {
     const a = createYjs1Doc();
     const b = createYjs1Doc();
     a.insertText(0, 'already here');
 
     // A minimal two-party room: each side's probe reaches the other's onSync;
     // heal frames are delivered to the other side's applyLive (app glue).
-    const aSync = new Set<(f: Uint8Array) => void>();
-    const bSync = new Set<(f: Uint8Array) => void>();
+    const aSync = new Set<(f: Uint8Array, peerId: string) => void>();
+    const bSync = new Set<(f: Uint8Array, peerId: string) => void>();
     const channelFor = (
-      mineSync: Set<(f: Uint8Array) => void>,
-      theirsSync: Set<(f: Uint8Array) => void>,
+      mineSync: Set<(f: Uint8Array, peerId: string) => void>,
+      theirsSync: Set<(f: Uint8Array, peerId: string) => void>,
       deliverHeal: (f: Uint8Array) => void,
     ) => ({
+      broadcastUpdate: () => {},
       broadcastSync: (frame: Uint8Array) => {
-        for (const h of theirsSync) h(frame);
+        for (const h of theirsSync) h(frame, 'peer');
       },
-      onSync: (handler: (frame: Uint8Array) => void) => {
+      onSync: (handler: (frame: Uint8Array, peerId: string) => void) => {
         mineSync.add(handler);
         return () => mineSync.delete(handler);
       },
       broadcastHeal: (frame: Uint8Array) => deliverHeal(frame),
     });
 
-    const offA = a.connectLiveSync(channelFor(aSync, bSync, (f) => b.applyLive(f)), { intervalMs: 60_000 });
-    const offB = b.connectLiveSync(channelFor(bSync, aSync, (f) => a.applyLive(f)), { intervalMs: 60_000 });
+    const options = { canWrite: () => true, syncIntervalMs: 60_000 };
+    const offA = a.connectLive(channelFor(aSync, bSync, (f) => b.applyLive(f)), options);
+    const offB = b.connectLive(channelFor(bSync, aSync, (f) => a.applyLive(f)), options);
 
     // B's connect-time probe reached A, which healed B immediately.
     expect(b.getText()).toBe('already here');
@@ -559,13 +561,14 @@ describe('CollabDoc — lifecycle', () => {
       const offText = doc.onTextChange(() => undefined);
       const offUpdate = doc.onLocalUpdate(() => undefined);
       let syncUnsubscribeCount = 0;
-      const offSync = doc.connectLiveSync({
+      const offSync = doc.connectLive({
+        broadcastUpdate: () => undefined,
         broadcastSync: () => undefined,
         broadcastHeal: () => undefined,
         onSync: () => () => {
           syncUnsubscribeCount++;
         },
-      }, { intervalMs: 60_000 });
+      }, { canWrite: () => true, syncIntervalMs: 60_000 });
 
       offText();
       offText();
