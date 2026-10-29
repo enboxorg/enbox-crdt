@@ -77,8 +77,8 @@ function failureFloor(error: unknown): string | undefined {
   try { addMicrosecondTick(floor); return floor; } catch { return undefined; }
 }
 
-/** Product notifications cannot change persistence outcomes or leak asynchronous rejections. */
-function notify(callback: () => void): void {
+/** @internal Product notifications cannot change persistence outcomes or leak rejections. */
+export function notify(callback: () => void): void {
   try { void Promise.resolve(callback()).catch(() => {}); } catch { /* Preserve the write's outcome. */ }
 }
 
@@ -132,11 +132,16 @@ export class DurableWriter {
     }
   }
 
-  /** Capture pending operations; an unusable backstop floor returns full known state for reconstruction and repair. */
+  /**
+   * Capture pending operations while the document is alive, including after this
+   * writer stops. Stopped writers and unusable backstop floors return full known
+   * state for repair, since a deleted parent may have removed the old baseline.
+   */
   public capturePendingUpdate(): Uint8Array | undefined {
-    if (this.disposed) return undefined;
     if (this.unverifiableBackstop !== undefined) return this.doc.encodeFullState();
-    return this.doc.planRepublish()?.delta;
+    const pending = this.doc.planRepublish();
+    if (pending === null) return undefined;
+    return this.disposed ? this.doc.encodeFullState() : pending.delta;
   }
 
   /**

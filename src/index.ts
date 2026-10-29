@@ -6,7 +6,7 @@
  *
  * - `@enbox/crdt/yjs1` — the baseline `yjs1` document factory
  * - `@enbox/crdt/yjs1/*` — adapters and explicit advanced engine access
- * - `@enbox/crdt/enbox` — DWN write classification + squash timestamp math
+ * - `@enbox/crdt/enbox` — document lifecycle, durable writers and DWN backstops
  * - `@enbox/crdt/live`  — transport-agnostic state-vector reconciliation
  *
  * @module

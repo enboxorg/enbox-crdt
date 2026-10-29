@@ -153,11 +153,13 @@ export function createCodeMirrorBinding<State extends object = AwarenessState>(
     destroy,
   };
 
-  const undo = (): boolean => {
+  const undo = (view: EditorView): boolean => {
+    if (view.state.readOnly) return false;
     if (active) manager.undo();
     return true;
   };
-  const redo = (): boolean => {
+  const redo = (view: EditorView): boolean => {
+    if (view.state.readOnly) return false;
     if (active) manager.redo();
     return true;
   };
@@ -223,12 +225,12 @@ export function createCodeMirrorBinding<State extends object = AwarenessState>(
     };
   });
   const historyInput = EditorView.domEventHandlers({
-    beforeinput: (event): boolean => {
+    beforeinput: (event, view): boolean => {
       if (event.inputType === 'historyUndo') {
-        return undo();
+        return undo(view);
       }
       if (event.inputType === 'historyRedo') {
-        return redo();
+        return redo(view);
       }
       return false;
     },

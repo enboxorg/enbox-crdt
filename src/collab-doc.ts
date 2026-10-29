@@ -313,7 +313,8 @@ export class CollabDoc<TDoc = unknown> {
   /**
    * Outbound realtime feed: fires an envelope-tagged incremental payload for
    * every transaction that did NOT come from {@link applyDurable}/
-   * {@link applyLive} — i.e. local edits (API or editor binding) and undo/redo.
+   * {@link applyLive} — local edits (API or editor binding), undo/redo, and
+   * unconfirmed changes merged by a local persistence adapter.
    * Broadcast these over the live channel; coalescing is the transport's job.
    */
   onLocalUpdate(listener: (frame: Uint8Array) => void): () => void {

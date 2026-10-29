@@ -1,5 +1,5 @@
 /**
- * Enbox/DWN integration: a serialized durable document writer, write-result
+ * Enbox/DWN integration: keyed document lifecycles, a serialized writer, write-result
  * classification, and squash temporal-backstop timestamp math. Native record
  * callbacks and structural status shapes keep this module SDK-independent.
  *
@@ -194,3 +194,8 @@ function formatEpochMicros(epochMicros: bigint): string {
 
 export { DurableWriter } from './durable-writer.js';
 export type { DurableWriterOptions, DurableWriterTimers, DurableWriterClock, DurableWriteRequest, DurableWriteRecord } from './durable-writer.js';
+export { DocumentSessions, DocumentNotReadyError, DocumentWriterDisposedError, PendingDocumentChangesError } from './document-sessions.js';
+export type {
+  DocumentLifecycleEvent, DocumentPersistence, DocumentSession, DocumentSessionsOptions,
+  DurableDocumentUpdate, OpenDocumentSessionOptions,
+} from './document-sessions.js';

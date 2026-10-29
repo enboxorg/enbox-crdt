@@ -975,8 +975,14 @@ describe('DurableWriter — unusable backstop metadata', () => {
     await expect(writer.drain()).rejects.toBe(failure);
     expect(create).toHaveBeenCalledOnce();
     const recovered = createYjs1Doc();
+    const repair = writer.capturePendingUpdate();
+    expect(repair).toBeDefined();
+    writer.dispose();
+    expect(writer.capturePendingUpdate()).toEqual(repair);
     recovered.applyLive(writer.capturePendingUpdate()!);
     expect(recovered.getText()).toBe('old + new');
-    writer.dispose(); doc.destroy(); base.destroy(); recovered.destroy();
+    await writer.flush();
+    expect(create).toHaveBeenCalledOnce();
+    doc.destroy(); base.destroy(); recovered.destroy();
   });
 });
