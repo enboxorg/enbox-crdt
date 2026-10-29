@@ -67,7 +67,7 @@ export interface DocumentSessionsOptions<Document extends CollabDoc, Awareness e
 /** Retained pending changes cannot be saved without writable access. */
 export class PendingDocumentChangesError extends Error {
   constructor() {
-    super('Pending document changes require writable access before they can be saved.');
+    super('Pending document changes must be applied and saved before this operation can finish.');
     this.name = 'PendingDocumentChangesError';
   }
 }
@@ -274,7 +274,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     }));
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failed !== undefined) throw failed.reason;
-    for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
+    for (const entry of this.entries.values()) this.clearConfirmedResidual(entry);
     if (this.staged.size > 0) throw new PendingDocumentChangesError();
   }
 
@@ -302,24 +302,24 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
    * Encoding/combination failures throw without discarding retained edits.
    */
   capturePending(): Array<{ key: string; update: Uint8Array }> {
-    for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
+    for (const entry of this.entries.values()) this.clearConfirmedResidual(entry);
     const pending = new Map(this.staged);
     for (const entry of this.entries.values()) {
-      if (entry.binding.writable || entry.retainResidual || pending.has(entry.key)) {
-        const session = entry.session;
-        const update = session?.writer.isDisposed && pending.has(entry.key)
-          ? session.doc.encodeFullState()
-          : session?.writer.capturePendingUpdate();
-        if (update !== undefined) {
-          const staged = pending.get(entry.key);
-          pending.set(entry.key, staged !== undefined && staged !== entry.appliedStage
-            ? this.withTemporaryDocument(doc => {
-              this.applyUpdate(doc, { data: staged });
-              this.applyUpdate(doc, { data: update });
-              return doc.encodeFullState();
-            }) : update);
-        }
-      }
+      const staged = pending.get(entry.key);
+      if (!entry.binding.writable && !entry.retainResidual && staged === undefined) continue;
+      const session = entry.session;
+      // An unapplied repair may depend on the baseline that a deleted parent removed.
+      const update = session?.writer.isDisposed && staged !== undefined
+        ? session.doc.encodeFullState()
+        : session?.writer.capturePendingUpdate();
+      if (update === undefined) continue;
+      if (staged !== undefined && staged !== entry.appliedStage) {
+        pending.set(entry.key, this.withTemporaryDocument(doc => {
+          this.applyUpdate(doc, { data: staged });
+          this.applyUpdate(doc, { data: update });
+          return doc.encodeFullState();
+        }));
+      } else pending.set(entry.key, update);
     }
     return [...pending].map(([key, update]) => ({ key, update: Uint8Array.from(update) }));
   }
@@ -340,7 +340,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
 
   /** Whether writable/local or staged state remains beyond known durable storage. */
   hasPending(): boolean {
-    for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
+    for (const entry of this.entries.values()) this.clearConfirmedResidual(entry);
     if (this.staged.size > 0) return true;
     for (const entry of this.entries.values()) {
       if ((entry.binding.writable || entry.retainResidual) && entry.session?.writer.capturePendingUpdate() !== undefined) return true;
@@ -444,7 +444,8 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     }
   }
 
-  private clearConfirmedStage(entry: Entry<Document, Awareness>): void {
+  /** Forget retention markers once their document state is known to be saved. */
+  private clearConfirmedResidual(entry: Entry<Document, Awareness>): void {
     if (!entry.retainResidual && entry.appliedStage === undefined) return;
     if (this.isCurrent(entry) && entry.session !== undefined
       && entry.session.writer.capturePendingUpdate() === undefined) {
@@ -482,10 +483,11 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   }
 
   private assertDrainReady(entry: Entry<Document, Awareness>): void {
-    this.clearConfirmedStage(entry);
-    if (entry.session?.writer.isDisposed && (entry.suspended || this.staged.has(entry.key)
-      || ((entry.binding.writable || entry.retainResidual) && entry.session.writer.capturePendingUpdate() !== undefined))) {
-      throw new DocumentWriterDisposedError();
+    this.clearConfirmedResidual(entry);
+    if (entry.session?.writer.isDisposed) {
+      const pending = this.staged.has(entry.key)
+        || ((entry.binding.writable || entry.retainResidual) && entry.session.writer.capturePendingUpdate() !== undefined);
+      if (entry.suspended || pending) throw new DocumentWriterDisposedError();
     }
     if (!entry.initialized || entry.suspended) throw new DocumentNotReadyError();
   }

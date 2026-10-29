@@ -91,7 +91,7 @@ do not arm the local-change listener. Existing durable convergence and recovery
 semantics remain unchanged.
 
 An optional persistence adapter is attached once. Opening waits for `whenSynced`
-and a strict durability drain before enabling autosave. A later persistence
+and, when writable, a strict durability drain before enabling autosave. A later persistence
 upgrade temporarily suspends autosave during that recovery. Attachment failures
 can be retried; failed recovery writes retain the document and synced adapter.
 Omitting persistence on a subsequent open does not detach it.
@@ -118,8 +118,7 @@ immediately, and an older close cannot dispose a newly reclaimed handle.
 `capturePending()` copies writable/local residuals for authority repair, including
 read-only edits made during pending or failed recovery. One local-update listener
 remains installed while autosave is suspended; recovery never hides those edits.
-Call
-`stage(key, update)` on a fresh owner before opening with new authority. It
+Call `stage(key, update)` on a fresh owner before opening with new authority. It
 validates the whole frame with a temporary document before retaining it, so a
 malformed frame cannot replace a valid repair or poison the retained document.
 Staged changes survive read-only access. Recovery captures the whole state beyond
@@ -140,24 +139,25 @@ pending until `open` merges it against the hydrated document or the host discard
 
 `writable: false` controls native write dispatch; it does not make the exposed
 `CollabDoc` immutable. If application code edits that document, its local-update
-feed retains the changes without writing. Close and durability barriers reject
-with `PendingDocumentChangesError` until the changes are confirmed, writable
-authority is restored, or the host explicitly discards them. An always-read-only
-document with only `applyLive` traffic has no pending write obligation.
-`DocumentNotReadyError` instead means hydration
-or recovery has not completed successfully; retry `open` before draining. These
-public errors also cover authority changes during a pending write/drain.
+feed retains the changes without writing. An always-read-only document with only
+`applyLive` traffic has no pending write obligation. Public lifecycle errors
+distinguish the cases that require action:
 
-A writer stopped by a deleted parent or explicit `writer.dispose()` cannot be
-restarted by rebinding. `open` rejects with `DocumentWriterDisposedError`; strict
-drain/close operations reject that error while relevant edits or recovery remain.
+| Error | Meaning and response |
+| --- | --- |
+| `DocumentNotReadyError` | Setup has not completed successfully. Retry `open` before draining. |
+| `PendingDocumentChangesError` | Retained changes remain. Open with writable access to apply/save them, await durable confirmation, or explicitly discard them. |
+| `DocumentWriterDisposedError` | The writer stopped permanently. Capture pending changes, then discard/recreate; rebinding alone cannot restart it. |
+
+A deleted parent or explicit `writer.dispose()` stops the writer. `open` rejects
+for a stopped writer; strict drain/close reject while relevant edits or recovery remain.
 Pending queries and export still inspect the retained document. Dirty stopped
 writers export full state because the old parent may have removed its baseline;
 pure capture requires the document to remain alive and never resumes writing.
 Capture before explicit discard/recreation when those edits must survive. An
 already-ready, clean stopped session can close normally. Applications that
-intentionally retire a deleted page should explicitly discard its session from `onParentGone` after
-detaching their live/editor bindings.
+intentionally retire a deleted page should explicitly discard its session from
+`onParentGone` after detaching their live/editor bindings.
 
 `discard(key)` and `dispose()` explicitly abandon owned state: they fence handles
 and stop scheduling immediately, then await adapter cleanup. Cache data is kept
@@ -167,8 +167,8 @@ pending changes. Lifecycle notifications report `opened` (new or reclaimed),
 `closing` (a close attempt, which may reject while retaining the handle), and
 `disposed` (ownership fenced and the document destroyed). These are notifications,
 not a complete state machine. Await the operation's promise for asynchronous
-adapter cleanup; `disposed` can arrive before that cleanup settles. A cleanup
-failure can reject after retirement, once the document's changes were drained.
+adapter cleanup; `disposed` can arrive before that cleanup settles. After a
+graceful close has drained changes, adapter cleanup can still reject after retirement.
 Failed initial opens emit no lifecycle notifications. Notification failures
 cannot change lifecycle outcomes.
 
