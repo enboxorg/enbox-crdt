@@ -40,15 +40,17 @@ and gates dispatch with the current application write policy.
 ```ts
 import { DocumentSessions } from '@enbox/crdt/enbox';
 import { createYjs1Doc } from '@enbox/crdt/yjs1';
-import { createAwareness } from '@enbox/crdt/yjs1/awareness';
 
 const documents = new DocumentSessions({
-  createDocument: () => {
-    const doc = createYjs1Doc();
-    return { doc, awareness: createAwareness(doc) };
-  },
+  createDocument: createYjs1Doc,
   timers: { idleMs: 2000, backstopMs: 30000, convergenceMs: 1000 },
   onError: (key, error) => reportDocumentError(key, error),
+  // Optional; imported only when an open requests recovery.
+  persistence: async (key, doc, signal) => {
+    const { createIndexedDbPersistence } = await import('@enbox/crdt/yjs1/indexeddb');
+    signal.throwIfAborted();
+    return createIndexedDbPersistence(`my-app:note:${key}`, doc);
+  },
 });
 
 const session = await documents.open(note.id, {
@@ -57,6 +59,7 @@ const session = await documents.open(note.id, {
   }),
   writable: mayEdit,
   canSquash: maySquash,
+  recover: true,
   load: async signal => {
     const page = await records.query('note/delta', {
       within: note.contextId, pagination: { limit: 100 },
@@ -71,18 +74,17 @@ const session = await documents.open(note.id, {
     }
     return updates;
   },
-  // Optional; can also be supplied when reopening a headless document.
-  persistence: async (doc, signal) => {
-    const { createIndexedDbPersistence } = await import('@enbox/crdt/yjs1/indexeddb');
-    signal.throwIfAborted();
-    return createIndexedDbPersistence(`my-app:note:${note.id}`, doc);
-  },
 });
 
 if (mayEdit) session.doc.insertText(0, 'Hello'); // One managed listener schedules local writes.
-session.writer.applyDurable(frame, { recordId, snapshot, messageTimestamp });
+session.applyDurable(frame, { recordId, snapshot, messageTimestamp });
 await documents.close(note.id);
 ```
+
+The stable handle exposes `doc`, `applyDurable` and `setTimers`. Writer lifetime
+stays with `DocumentSessions`; the standalone writer below remains available for
+custom persistence. Editor/live code can call `createAwareness(session.doc)` to
+obtain the existing document-lifetime cached awareness handle.
 
 `open` coalesces creation and returns the same handle while it is retained.
 `load` runs only for a new document; prefetched `updates` are applied on every
@@ -90,20 +92,22 @@ open, including a rebind to fresh native write authority. Remote/live operations
 do not arm the local-change listener. Existing durable convergence and recovery
 semantics remain unchanged.
 
-An optional persistence adapter is attached once. Opening waits for `whenSynced`
-and, when writable, a strict durability drain before enabling autosave. A later persistence
-upgrade temporarily suspends autosave during that recovery. Attachment failures
-can be retried; failed recovery writes retain the document and synced adapter.
-Omitting persistence on a subsequent open does not detach it.
-If an attachment or initial synchronization fails, the next queued open uses
-its supplied factory. A successful attachment is retained, including when only
-its subsequent save failed.
+Configure the optional persistence factory on the owner; `recover: true` on
+`open` requests its adapter. Headless opens can request recovery later.
+An adapter is attached once per document. Opening waits for `whenSynced`
+and, when writable, a strict durability drain before enabling autosave. A later
+recovery request suspends autosave while cached updates merge. Attachment failures
+retry the same configured factory; failed recovery writes retain the document
+and synced adapter. Omitting `recover` later does not detach it, and requesting
+recovery without a configured factory rejects. Persistence adapters must provide
+idempotent `destroy` and, when supported, `clearData`;
+the shipped IndexedDB adapter already provides this contract.
 
 `whenSynced` marks the initial recovery barrier, not the end of all cache updates.
 For example, IndexedDB maintenance can later merge another tab's stored changes.
 Those unconfirmed cache changes use the local-update feed: writable sessions
 schedule a save and read-only sessions retain them for repair. Network transports
-must use `applyLive` or `writer.applyDurable` to preserve their distinct origins.
+must use `doc.applyLive` or `session.applyDurable` to preserve their distinct origins.
 
 `close` joins hydration and drains before disposing. A failed drain rejects and
 retains the handle; reopen reclaims it, so an older close cannot destroy a newly
@@ -118,24 +122,23 @@ immediately, and an older close cannot dispose a newly reclaimed handle.
 `capturePending()` copies writable/local residuals for authority repair, including
 read-only edits made during pending or failed recovery. One local-update listener
 remains installed while autosave is suspended; recovery never hides those edits.
-Call `stage(key, update)` on a fresh owner before opening with new authority. It
-validates the whole frame with a temporary document before retaining it, so a
-malformed frame cannot replace a valid repair or poison the retained document.
-Staged changes survive read-only access. Recovery captures the whole state beyond
-the durable shadow, not only operations authored by this client: peer live edits
+Call `stage(key, update)` before opening its key. Opening, open and retained keys
+reject staging. The whole frame is validated with a temporary bare document, so
+malformed bytes cannot replace a valid repair. Initial hydration applies the
+repair before exposing the handle, then consumes the staged frame even for
+read-only access; the document retains its unconfirmed changes. Recovery captures
+the whole state beyond the durable shadow, not only this client's operations: peer live edits
 can ride along once a document has local changes or a staged repair. Demotion
 also retains the former writable document's residual, even if it contains only
 peer live edits. This preserves the existing healing policy.
 
-The factory must create a fresh empty in-memory document. Temporary documents
-also combine an unapplied repair and live residual during capture, without
-mutating the retained document. If applying a validated repair to the live
-document nevertheless fails, `open` rejects and pauses writes; it preserves both
-the document and repair for capture and retry. It never clears recovery data to
-hide that failure. All `open` failures reject its returned promise.
-Encoding or combining recovery frames can make `capturePending()` throw; a
-failed export does not discard retained edits. An unapplied staged repair stays
-pending until `open` merges it against the hydrated document or the host discards it.
+The factory must create a fresh empty in-memory document. If initial hydration
+or repair application fails, `open` rejects, destroys the incomplete document,
+and keeps the original staged frame for a fresh attempt. Later persistence
+failures retain the hydrated document and its changes. All `open` failures reject
+its returned promise. Encoding can make `capturePending()` throw without
+discarding retained edits. An unapplied staged repair remains pending until
+successful initialization or explicit discard.
 
 `writable: false` controls native write dispatch; it does not make the exposed
 `CollabDoc` immutable. If application code edits that document, its local-update
@@ -149,7 +152,7 @@ distinguish the cases that require action:
 | `PendingDocumentChangesError` | Retained changes remain. Open with writable access to apply/save them, await durable confirmation, or explicitly discard them. |
 | `DocumentWriterDisposedError` | The writer stopped permanently. Capture pending changes, then discard/recreate; rebinding alone cannot restart it. |
 
-A deleted parent or explicit `writer.dispose()` stops the writer. `open` rejects
+A deleted parent stops the private writer. `open` rejects
 for a stopped writer; strict drain/close reject while relevant edits or recovery remain.
 Pending queries and export still inspect the retained document. Dirty stopped
 writers export full state because the old parent may have removed its baseline;
