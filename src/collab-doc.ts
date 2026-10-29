@@ -121,6 +121,8 @@ export class CollabDoc<TDoc = unknown> {
   private undoHandle: ReturnType<DocEngine<TDoc>['createUndo']> | undefined;
   private readonly teardowns = new Set<() => void>();
   private destroyed = false;
+  /** Reserved during setup and until live detachment finishes. */
+  private liveAttached = false;
 
   constructor(engine: DocEngine<TDoc>, options: CollabDocOptions = {}) {
     this.engine = engine;
@@ -472,26 +474,39 @@ export class CollabDoc<TDoc = unknown> {
    * Returns an idempotent detach, also run by destroy. Neither channel nor awareness
    * ownership transfers; durable writes remain independent of this live attachment.
    * Broadcast errors are ignored; invalid options and failed subscriptions throw.
+   * Only one attachment may be active. Detach before attaching another channel or
+   * explicitly destroying borrowed awareness; document destruction detaches automatically.
    */
   connectLive<State extends object = Record<string, unknown>>(
     channel: LiveChannel,
     options: LiveConnectionOptions<State>,
   ): () => void {
     this.assertAlive();
-    const off = bindLiveDocument(
-      this.engine,
-      this.live,
-      handler => this.onLocalUpdate(handler),
-      () => !this.destroyed,
-      channel,
-      options,
-    );
-    // A channel callback can synchronously retire the document during attachment.
-    if (this.destroyed) {
-      off();
-      this.assertAlive();
+    if (this.liveAttached) {
+      throw new Error('Document already has a live attachment. Detach it before connecting again.');
     }
-    return this.registerTeardown(off);
+    this.liveAttached = true;
+    try {
+      const off = bindLiveDocument(
+        this.engine,
+        this.live,
+        handler => this.onLocalUpdate(handler),
+        () => !this.destroyed,
+        channel,
+        options,
+      );
+      // A channel callback can synchronously retire the document during attachment.
+      if (this.destroyed) {
+        off();
+        this.assertAlive();
+      }
+      return this.registerTeardown(() => {
+        try { off(); } finally { this.liveAttached = false; }
+      });
+    } catch (error) {
+      this.liveAttached = false;
+      throw error;
+    }
   }
 
   // -------------------------------------------------------------------------

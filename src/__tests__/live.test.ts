@@ -66,6 +66,20 @@ describe('wireLiveSync', () => {
     return doc;
   };
 
+  it('rejects invalid intervals before subscribing or scheduling probes', () => {
+    const fake = fakeChannel();
+    const onSync = vi.spyOn(fake.channel, 'onSync');
+    const onStatus = vi.spyOn(fake.channel, 'onStatus');
+    for (const intervalMs of [0, -1, NaN, Infinity, 2_147_483_648]) {
+      expect(() => wireLiveSync(yjs1, fake.channel, () => undefined, () => true, { intervalMs }))
+        .toThrow(RangeError);
+    }
+    expect(onSync).not.toHaveBeenCalled();
+    expect(onStatus).not.toHaveBeenCalled();
+    expect(fake.syncFrames).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('probes immediately, per interval, and on reconnect — with enveloped state vectors', () => {
     const fake = fakeChannel();
     const doc = docWith('hello');

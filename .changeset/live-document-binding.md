@@ -8,3 +8,5 @@ detachment. Keep wireLiveSync as the lower-level reconciliation primitive.
 Roll back partial synchronization attachments when channel setup fails.
 Validate timer intervals and isolate broadcast failures from document edits and
 durable-write scheduling.
+Allow one live attachment per document and require borrowed awareness to outlive
+the attachment.

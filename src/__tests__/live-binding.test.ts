@@ -72,16 +72,58 @@ describe('live document binding', () => {
     expect(vi.getTimerCount()).toBe(timers);
   });
 
-  it('releases partial channel subscriptions when attachment fails', () => {
+  it.each([
+    'onAwareness', 'onSync', 'onStatus', 'onBackpressure', 'onLocalUpdate', 'onUpdate',
+  ] as const)('releases earlier work when %s subscription fails', stage => {
     const doc = document();
     const awareness = createAwareness(doc);
     const channel = new Channel();
-    const failure = new Error('status unavailable');
-    vi.spyOn(channel, 'onStatus').mockImplementation(() => { throw failure; });
+    const failure = new Error('subscription unavailable');
+    const fail = () => { throw failure; };
+    const subscription = stage === 'onLocalUpdate' ? vi.spyOn(doc, stage).mockImplementation(fail)
+      : stage === 'onUpdate' ? vi.spyOn(awareness, stage).mockImplementation(fail)
+        : vi.spyOn(channel, stage).mockImplementation(fail);
+    const timers = vi.getTimerCount();
     expect(() => doc.connectLive(channel, { canWrite: () => true, awareness })).toThrow(failure);
-    expect([channel.syncListeners.size, channel.awarenessListeners.size]).toEqual([0, 0]);
+    expect([channel.syncListeners.size, channel.awarenessListeners.size,
+      channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
+    expect(vi.getTimerCount()).toBe(timers);
     doc.insertText(0, 'still usable');
     expect(channel.updates).toEqual([]);
+    subscription.mockRestore();
+    const detach = doc.connectLive(channel, { canWrite: () => true, awareness });
+    detach();
+  });
+
+  it('holds one attachment claim through setup, use, and teardown', () => {
+    const doc = document();
+    const awareness = createAwareness(doc);
+    const channel = new Channel();
+    const replacement = new Channel();
+    const options = { canWrite: () => true, awareness };
+    const blocked: unknown[] = [];
+    const reconnect = () => {
+      try { doc.connectLive(replacement, options); }
+      catch (error) { blocked.push(error); }
+    };
+    channel.broadcastSync = reconnect;
+    const detach = doc.connectLive(channel, options);
+    expect(blocked).toHaveLength(1); // Initial sync cannot reenter attachment.
+    reconnect();
+    expect(blocked).toHaveLength(2);
+    channel.broadcastAwareness = reconnect;
+    detach();
+    expect(blocked).toHaveLength(3); // Departure cannot attach before cleanup finishes.
+    for (const error of blocked) {
+      expect(error).toEqual(new Error('Document already has a live attachment. Detach it before connecting again.'));
+    }
+    expect([replacement.syncListeners.size, replacement.awarenessListeners.size]).toEqual([0, 0]);
+    const detachReplacement = doc.connectLive(replacement, options);
+    detach(); // An old detach must not release the replacement's claim.
+    expect(() => doc.connectLive(new Channel(), options)).toThrow('Document already has a live attachment.');
+    doc.insertText(0, 'fresh');
+    expect(replacement.updates).toHaveLength(1);
+    detachReplacement();
   });
 
   it.each(['sync', 'awareness'] as const)('releases attachment work if initial %s send destroys the document', kind => {
@@ -91,6 +133,40 @@ describe('live document binding', () => {
     vi.spyOn(channel, kind === 'sync' ? 'broadcastSync' : 'broadcastAwareness')
       .mockImplementation(() => { doc.destroy(); });
     expect(() => doc.connectLive(channel, { canWrite: () => true, awareness })).toThrow(/destroyed/);
+    expect([channel.syncListeners.size, channel.awarenessListeners.size,
+      channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not rearm batching when the first local send destroys the document', () => {
+    const doc = document();
+    const awareness = createAwareness(doc);
+    const channel = new Channel();
+    doc.connectLive(channel, { canWrite: () => true, awareness });
+    channel.broadcastUpdate = frame => { channel.updates.push(frame); doc.destroy(); };
+    expect(() => doc.insertText(0, 'last edit')).not.toThrow();
+    expect(channel.updates).toHaveLength(1);
+    expect([channel.syncListeners.size, channel.awarenessListeners.size,
+      channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('detaches before borrowed awareness is destroyed, leaving the document usable', () => {
+    const doc = document();
+    const awareness = createAwareness(doc);
+    const channel = new Channel();
+    const detach = doc.connectLive(channel, { canWrite: () => true, awareness });
+    awareness.setLocalState({ cursor: 1 }); // Leave a cursor send pending.
+    detach();
+    awareness.destroy();
+    const sent = channel.awareness.length;
+    channel.receiveAwareness(new Uint8Array());
+    channel.receiveSync(new Uint8Array());
+    vi.advanceTimersByTime(10_000);
+    doc.insertText(0, 'still usable');
+    expect(doc.getText()).toBe('still usable');
+    expect(channel.updates).toEqual([]);
+    expect(channel.awareness).toHaveLength(sent);
     expect([channel.syncListeners.size, channel.awarenessListeners.size,
       channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
     expect(vi.getTimerCount()).toBe(0);
@@ -305,7 +381,6 @@ describe('live document binding', () => {
     doc.insertText(0, 'first');
     doc.insertText(5, ' last');
     doc.destroy();
-    detach();
     expect(channel.updates).toHaveLength(2);
     channel.updates.forEach(frame => receiver.applyLive(frame));
     expect(receiver.getText()).toBe('first last');
@@ -313,7 +388,9 @@ describe('live document binding', () => {
     expect(receiverAwareness.getStates().has(awareness.clientId)).toBe(false);
     expect([channel.syncListeners.size, channel.awarenessListeners.size,
       channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
+    expect(vi.getTimerCount()).toBe(1); // Only the receiver's awareness timer remains.
     const sent = [channel.updates.length, channel.sync.length, channel.awareness.length];
+    detach(); // The returned teardown is a no-op after automatic detachment.
     vi.advanceTimersByTime(10_000);
     expect([channel.updates.length, channel.sync.length, channel.awareness.length]).toEqual(sent);
   });

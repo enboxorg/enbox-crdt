@@ -43,7 +43,7 @@ export interface CollabAwareness<State extends object = AwarenessState> {
 
   /** Observe awareness changes. The returned teardown is idempotent. */
   onUpdate(listener: (change: AwarenessChange, origin: unknown) => void): () => void;
-  /** Stop timers and observers. Idempotent, including after document destroy. */
+  /** Stop timers and observers. Detach live bindings first; safe to repeat after document destroy. */
   destroy(): void;
 }
 

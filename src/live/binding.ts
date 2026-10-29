@@ -28,7 +28,10 @@ export interface LiveConnectionOptions<State extends object = Record<string, unk
   canWrite(peerId: string): boolean;
   /** False receives cursors without sending updates, probes, heal replies, or cursors. Default true. */
   broadcast?: boolean;
-  /** Borrowed document-bound awareness; detaching preserves local state and removes remote cursors. */
+  /**
+   * Borrowed document-bound awareness. Keep it alive until detach; detaching
+   * preserves local state and removes remote cursors. doc.destroy() detaches first.
+   */
   awareness?: CollabAwareness<State>;
   /** Local edits send immediately, then coalesce at this cadence. Default 200 ms. */
   updateIntervalMs?: number;

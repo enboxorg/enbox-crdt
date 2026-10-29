@@ -355,14 +355,26 @@ without sending edits, sync probes, heal replies, or cursor announcements. Omit
 
 Detach is idempotent and also runs on document destruction. It releases listeners
 and timers, sends remaining local frames and cursor departure best-effort, clears
-remote cursors, and preserves local cursor state for reattachment. Browsers also
-announce cursor departure on `pagehide`. The application still owns the channel.
+remote cursors, and preserves local cursor state for reattachment. Only one
+`connectLive()` attachment may be active per document; detach before connecting
+another channel. This keeps the document's shared cursor state with one room.
+The application still owns the channel and must keep borrowed awareness alive
+until detach. Call `detach()` before explicitly calling `awareness.destroy()`;
+`doc.destroy()` already performs that ordering automatically.
+
+In browsers, broadcasting attachments clear local awareness and announce departure
+on `pagehide`, including when entering the back/forward cache. The binding does not
+restore awareness on `pageshow`; a host that resumes the cached page must republish
+its local state. These events do not transfer channel or document ownership.
 
 Durable writes remain separate: small live batches reduce latency; later DWN
 records confirm the same operations in the durable shadow. Receiving those records
 does not reapply already-merged text. `DocumentSessions` retains document and writer
 ownership. Custom integrations can use the lower-level `wireLiveSync()` primitive
 from `@enbox/crdt/live` for reconciliation alone.
+
+During normal operation, failures encoding local updates or cursors remain visible;
+they are not treated as transport loss. Detachment remains best effort.
 
 ## Awareness
 
