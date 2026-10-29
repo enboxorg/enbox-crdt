@@ -3,11 +3,11 @@ import type { CollabAwareness } from '../yjs1/awareness.js';
 import type { SyncChannel } from './index.js';
 
 import { decodeEnvelope, encodeEnvelope } from '../envelope.js';
-import { wireLiveSync } from './index.js';
+import { LIVE_SYNC_INTERVAL_MS, wireLiveSync } from './index.js';
 
 /** Channel operations used by a document's live attachment; the caller owns the channel. */
 export interface LiveChannel extends Omit<SyncChannel, 'onSync'> {
-  /** Send one enveloped local-update batch. Delivery remains best effort. */
+  /** Send one enveloped local-update batch. Broadcast failures are isolated from document edits. */
   broadcastUpdate(frame: Uint8Array): void;
   /** Supply the authenticated transport peer, not a self-asserted DID from the payload. */
   onSync(handler: (frame: Uint8Array, peerId: string) => void): () => void;
@@ -19,7 +19,10 @@ export interface LiveChannel extends Omit<SyncChannel, 'onSync'> {
   onAwareness?(handler: (frame: Uint8Array, peerId: string) => void): () => void;
 }
 
-/** Policy for one live attachment. Incoming document frames remain caller-admitted via applyLive. */
+/**
+ * Policy for one live attachment. Incoming document frames remain caller-admitted via applyLive.
+ * Intervals must be finite and greater than zero, up to the timer limit of 2,147,483,647 ms.
+ */
 export interface LiveConnectionOptions<State extends object = Record<string, unknown>> {
   /** Check current permission for each incoming sync/cursor frame; unknown peers must be denied. */
   canWrite(peerId: string): boolean;
@@ -51,6 +54,16 @@ export function bindLiveDocument<TDoc, State extends object>(
   const broadcast = options.broadcast !== false;
   const updateInterval = options.updateIntervalMs ?? 200;
   const awarenessInterval = options.awarenessIntervalMs ?? 300;
+  const syncInterval = options.syncIntervalMs ?? LIVE_SYNC_INTERVAL_MS;
+  for (const [name, interval] of Object.entries({
+    updateIntervalMs: updateInterval,
+    awarenessIntervalMs: awarenessInterval,
+    syncIntervalMs: syncInterval,
+  })) {
+    if (!Number.isFinite(interval) || interval <= 0 || interval > 2_147_483_647) {
+      throw new RangeError(`${name} must be finite, greater than zero, and at most 2,147,483,647 ms.`);
+    }
+  }
   let updateDelay = updateInterval;
   let awarenessDelay = awarenessInterval;
   let active = true;
@@ -63,15 +76,20 @@ export function bindLiveDocument<TDoc, State extends object>(
   // Browser departure is optional; importing the package does not require a DOM.
   const page = (globalThis as typeof globalThis & { window?: EventTarget }).window;
 
+  const send = (operation: () => void): void => {
+    try { void Promise.resolve(operation()).catch(() => {}); }
+    catch { /* Live delivery is best effort; persistence must keep running. */ }
+  };
   const sendUpdates = (): void => {
     const batch = pendingUpdates;
     pendingUpdates = [];
     if (batch.length > 1 && engine.mergeDeltas !== undefined) {
       // These frames came from this document; merge only captured local operations.
       const payload = engine.mergeDeltas(batch.map(frame => decodeEnvelope(frame).payload));
-      channel.broadcastUpdate(encodeEnvelope(engine.formatId, payload));
+      const frame = encodeEnvelope(engine.formatId, payload);
+      send(() => channel.broadcastUpdate(frame));
     } else {
-      for (const frame of batch) channel.broadcastUpdate(frame);
+      for (const frame of batch) send(() => channel.broadcastUpdate(frame));
     }
   };
   const flushUpdates = (): void => {
@@ -83,14 +101,16 @@ export function bindLiveDocument<TDoc, State extends object>(
   const sendAwareness = (): void => {
     awarenessTimer = undefined;
     if (current() && awareness !== undefined) {
-      channel.broadcastAwareness!(awareness.encodeUpdate([awareness.clientId]));
+      const frame = awareness.encodeUpdate([awareness.clientId]);
+      send(() => channel.broadcastAwareness!(frame));
     }
   };
   const announceDeparture = (): void => {
     if (!broadcast || awareness === undefined) return;
     try {
       awareness.removeStates([awareness.clientId], 'teardown');
-      channel.broadcastAwareness!(awareness.encodeUpdate([awareness.clientId]));
+      const frame = awareness.encodeUpdate([awareness.clientId]);
+      send(() => channel.broadcastAwareness!(frame));
     } catch { /* Cursor expiry is the fallback for best-effort departure. */ }
   };
   const detach = (): void => {
@@ -147,16 +167,16 @@ export function bindLiveDocument<TDoc, State extends object>(
     }
     if (broadcast) {
       cleanups.push(wireLiveSync(engine, {
-        broadcastSync: frame => channel.broadcastSync(frame),
-        broadcastHeal: frame => channel.broadcastHeal(frame),
+        broadcastSync: frame => send(() => channel.broadcastSync(frame)),
+        broadcastHeal: frame => send(() => channel.broadcastHeal(frame)),
         onSync: handler => channel.onSync((frame, peerId) => {
           if (current() && options.canWrite(peerId)) handler(frame);
         }),
         onStatus: channel.onStatus === undefined ? undefined : handler => channel.onStatus!(handler),
-      }, () => doc, current, { intervalMs: options.syncIntervalMs }));
+      }, () => doc, current, { intervalMs: syncInterval }));
       if (channel.onBackpressure !== undefined) {
         cleanups.push(channel.onBackpressure(interval => {
-          if (!current() || !Number.isFinite(interval)) return;
+          if (!current() || !Number.isFinite(interval) || interval < 0 || interval > 2_147_483_647) return;
           updateDelay = Math.max(updateInterval, interval);
           awarenessDelay = Math.max(awarenessInterval, interval);
         }));

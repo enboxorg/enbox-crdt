@@ -471,6 +471,7 @@ export class CollabDoc<TDoc = unknown> {
    * canWrite checks current authority for each incoming sync/cursor frame.
    * Returns an idempotent detach, also run by destroy. Neither channel nor awareness
    * ownership transfers; durable writes remain independent of this live attachment.
+   * Broadcast errors are ignored; invalid options and failed subscriptions throw.
    */
   connectLive<State extends object = Record<string, unknown>>(
     channel: LiveChannel,

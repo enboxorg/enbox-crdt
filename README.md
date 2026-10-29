@@ -342,6 +342,12 @@ and the 3000 ms sync-probe interval are configurable. Engines without a batch
 merge operation send each queued frame individually. Remote live/durable frames
 do not echo through the local-update feed.
 
+Intervals must be finite and positive, at most 2,147,483,647 ms; invalid options
+throw `RangeError` before any subscriptions start. Invalid backpressure values
+are ignored. Broadcast errors, including rejected promises, are isolated even on
+initial sends; they cannot interrupt local-edit observers or durable scheduling.
+Failed subscriptions also throw, after releasing earlier subscriptions.
+
 Use `broadcast: false` for a receive-only attachment: it receives admitted cursors
 without sending edits, sync probes, heal replies, or cursor announcements. Omit
 `awareness` for text-only channels. Otherwise the channel must provide both

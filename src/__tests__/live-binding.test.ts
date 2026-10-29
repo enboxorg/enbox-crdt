@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isEnvelope } from '../index.js';
+import { DurableWriter, type DurableWriterOptions } from '../enbox/durable-writer.js';
 import { createAwareness } from '../yjs1/awareness.js';
 import { createYjs1Doc } from '../yjs1/index.js';
 
@@ -53,6 +54,24 @@ afterEach(() => {
 });
 
 describe('live document binding', () => {
+  it('rejects invalid timing options before attaching channel work', () => {
+    const doc = document();
+    const awareness = createAwareness(doc);
+    const channel = new Channel();
+    const subscriptions = ['onSync', 'onAwareness', 'onStatus', 'onBackpressure'] as const;
+    const spies = subscriptions.map(name => vi.spyOn(channel, name));
+    const timers = vi.getTimerCount();
+    for (const option of ['updateIntervalMs', 'awarenessIntervalMs', 'syncIntervalMs'] as const) {
+      for (const value of [0, -1, NaN, Infinity, 2_147_483_648]) {
+        expect(() => doc.connectLive(channel, {
+          canWrite: () => true, awareness, [option]: value,
+        })).toThrow(RangeError);
+      }
+    }
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(timers);
+  });
+
   it('releases partial channel subscriptions when attachment fails', () => {
     const doc = document();
     const awareness = createAwareness(doc);
@@ -171,6 +190,7 @@ describe('live document binding', () => {
     const channel = new Channel();
     doc.connectLive(channel, { canWrite: () => true, awareness });
     channel.backpressure(1_000);
+    for (const invalid of [NaN, Infinity, -1, 2_147_483_648]) channel.backpressure(invalid);
     const remote = document('remote');
     doc.applyLive(remote.encodeFullState());
     doc.applyDurable(remote.encodeFullState(), { recordId: 'stored' });
@@ -191,6 +211,57 @@ describe('live document binding', () => {
     receiver.applyUpdate(channel.awareness.at(-1)!, 'remote');
     expect(receiver.getStates().get(awareness.clientId)).toEqual({ cursor: 2 });
     expect(doc.hasUnflushedChanges()).toBe(true);
+  });
+
+  it.each(['throw', 'reject'] as const)('keeps autosave running when transport sends %s', async failureMode => {
+    const doc = document();
+    const awareness = createAwareness(doc);
+    const channel = new Channel();
+    const sends = ['broadcastUpdate', 'broadcastSync', 'broadcastHeal', 'broadcastAwareness'] as const;
+    for (const method of sends) {
+      const capture = channel[method].bind(channel);
+      channel[method] = frame => {
+        capture(frame);
+        const failure = new Error('transport unavailable');
+        if (failureMode === 'throw') throw failure;
+        return Promise.reject(failure);
+      };
+    }
+    const detach = doc.connectLive(channel, { canWrite: () => true, awareness });
+    const create = vi.fn<DurableWriterOptions['create']>(async () => ({
+      id: 'durable', timestamp: '2026-01-01T00:00:00.000000Z',
+    }));
+    const writer = new DurableWriter({
+      doc, create, timers: { idleMs: 2_000, backstopMs: 30_000, convergenceMs: 1_000 },
+    });
+    // This observer must still run after the live attachment's failed send.
+    const offLocal = doc.onLocalUpdate(() => writer.onLocalChange());
+    try {
+      expect(() => doc.insertText(0, 'first')).not.toThrow();
+      expect(() => doc.insertText(5, ' batch')).not.toThrow();
+      awareness.setLocalState({ cursor: 1 });
+      const peer = document();
+      const peerChannel = new Channel();
+      peer.connectLive(peerChannel, { canWrite: () => true });
+      expect(() => channel.receiveSync(peerChannel.sync[0]!)).not.toThrow();
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(channel.updates).toHaveLength(2);
+      expect(channel.heals).toHaveLength(1);
+      expect(channel.sync).toHaveLength(2);
+      expect(channel.awareness).toHaveLength(2);
+      expect(create).toHaveBeenCalledOnce(); // Autosave ran before any explicit drain.
+      await writer.drain();
+      expect(doc.hasUnflushedChanges()).toBe(false);
+      peer.applyDurable(create.mock.calls[0]![0].data, { recordId: 'durable' });
+      expect(peer.getText()).toBe('first batch');
+    } finally {
+      offLocal();
+      writer.dispose();
+      detach();
+    }
+    expect([channel.syncListeners.size, channel.awarenessListeners.size,
+      channel.statusListeners.size, channel.pressureListeners.size]).toEqual([0, 0, 0, 0]);
   });
 
   it('checks current peer permission on every sync probe and awareness update', () => {

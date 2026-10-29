@@ -43,7 +43,7 @@ export interface SyncChannel {
 
 /** Options for {@link wireLiveSync}. */
 export interface LiveSyncOptions {
-  /** Probe cadence in milliseconds. Defaults to {@link LIVE_SYNC_INTERVAL_MS}. */
+  /** Finite positive probe cadence, at most 2,147,483,647 ms. Defaults to {@link LIVE_SYNC_INTERVAL_MS}. */
   intervalMs?: number;
 }
 
@@ -70,6 +70,9 @@ export function wireLiveSync<TDoc>(
   options: LiveSyncOptions = {},
 ): () => void {
   const intervalMs = options.intervalMs ?? LIVE_SYNC_INTERVAL_MS;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0 || intervalMs > 2_147_483_647) {
+    throw new RangeError('intervalMs must be finite, greater than zero, and at most 2,147,483,647 ms.');
+  }
   let stopped = false;
 
   const probe = (): void => {
