@@ -95,6 +95,9 @@ and a strict durability drain before enabling autosave. A later persistence
 upgrade temporarily suspends autosave during that recovery. Attachment failures
 can be retried; failed recovery writes retain the document and synced adapter.
 Omitting persistence on a subsequent open does not detach it.
+If an attachment or initial synchronization fails, the next queued open uses
+its supplied factory. A successful attachment is retained, including when only
+its subsequent save failed.
 
 `whenSynced` marks the initial recovery barrier, not the end of all cache updates.
 For example, IndexedDB maintenance can later merge another tab's stored changes.
@@ -102,7 +105,7 @@ Those unconfirmed cache changes use the local-update feed: writable sessions
 schedule a save and read-only sessions retain them for repair. Network transports
 must use `applyLive` or `writer.applyDurable` to preserve their distinct origins.
 
-`close` joins hydration and drains before disposing. A failed close rejects and
+`close` joins hydration and drains before disposing. A failed drain rejects and
 retains the handle; reopen reclaims it, so an older close cannot destroy a newly
 claimed document. `get` and `values` include retained closing documents but hide
 incomplete hydration. `flush(key)` is best effort; `drain(key)` and `drainAll()`
@@ -112,12 +115,22 @@ Rebinding changes that target immediately, including while an older open is
 waiting. Hydration and recovery setup are serialized; discard cancels them
 immediately, and an older close cannot dispose a newly reclaimed handle.
 
-`capturePending()` copies writable residuals for authority repair. Call
+`capturePending()` copies writable/local residuals for authority repair, including
+read-only edits made during pending or failed recovery. One local-update listener
+remains installed while autosave is suspended; recovery never hides those edits.
+Call
 `stage(key, update)` on a fresh owner before opening with new authority. It
 validates the whole frame with a temporary document before retaining it, so a
 malformed frame cannot replace a valid repair or poison the retained document.
 Staged changes survive read-only access. Demoting a writable document also
 retains its pending changes.
+
+The factory must create a fresh empty in-memory document. Temporary documents
+also combine an unapplied repair and live residual during capture, without
+mutating the retained document. If applying a validated repair to the live
+document nevertheless fails, `open` rejects and pauses writes; it preserves both
+the document and repair for capture and retry. It never clears recovery data to
+hide that failure. All `open` failures reject its returned promise.
 
 `writable: false` controls native write dispatch; it does not make the exposed
 `CollabDoc` immutable. If application code edits that document, its local-update
@@ -133,8 +146,13 @@ and stop scheduling immediately, then await adapter cleanup. Cache data is kept
 unless `discard(key, { clearPersistence: true })` requests its deletion through
 the adapter. Call `drainAll()` before `dispose()` when shutdown must preserve
 pending changes. Lifecycle notifications report `opened` (new or reclaimed),
-`closing` and `disposed`; failed initial opens emit no lifecycle notifications.
-Notification failures cannot change lifecycle outcomes.
+`closing` (a close attempt, which may reject while retaining the handle), and
+`disposed` (ownership fenced and the document destroyed). These are notifications,
+not a complete state machine. Await the operation's promise for asynchronous
+adapter cleanup; `disposed` can arrive before that cleanup settles. A cleanup
+failure can reject after retirement, once the document's changes were drained.
+Failed initial opens emit no lifecycle notifications. Notification failures
+cannot change lifecycle outcomes.
 
 ## Document primitives
 

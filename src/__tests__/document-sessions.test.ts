@@ -181,6 +181,42 @@ describe('document ownership', () => {
 });
 
 describe('document recovery', () => {
+  it.each(['pending', 'failed'] as const)('captures readonly local edits while recovery is %s without capturing live traffic alone', async state => {
+    const test = fixture();
+    const synced = deferred<void>();
+    const failure = new Error('cache failed');
+    const handoff = createYjs1Doc();
+    const persistence = vi.fn(() => ({ whenSynced: synced.promise, destroy: vi.fn() }));
+    const opening = test.open({ writable: false, persistence });
+    const settled = opening.catch(error => error);
+    try {
+      await vi.waitFor(() => expect(persistence).toHaveBeenCalledOnce());
+      const session = test.sessions.get('page')!;
+      session.doc.applyLive(update('peer live').data);
+      expect(test.sessions.capturePending()).toEqual([]);
+      if (state === 'failed') {
+        synced.reject(failure);
+        expect(await settled).toBe(failure);
+      }
+      session.doc.insertText(session.doc.getText().length, ' readonly draft');
+      const pending = test.sessions.capturePending();
+      expect(pending).toHaveLength(1);
+      expect(handoff.applyLive(pending[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toContain('readonly draft');
+      expect(test.sessions.hasPending()).toBe(true);
+      expect(test.create).not.toHaveBeenCalled();
+      expect(test.sessions.get('page')).toBe(session);
+      if (state === 'failed') {
+        await expect(test.sessions.close('page')).rejects.toBeInstanceOf(DocumentNotReadyError);
+      }
+    } finally {
+      synced.resolve();
+      await settled;
+      handoff.destroy();
+      await test.sessions.dispose();
+    }
+  });
+
   it('upgrades a headless document once, waits for recovery, drains strictly and resumes one local listener', async () => {
     vi.useFakeTimers();
     const test = fixture();
@@ -260,6 +296,50 @@ describe('document recovery', () => {
     expect(destroy).toHaveBeenCalledTimes(phase === 'sync' ? 1 : 0);
     await test.sessions.dispose();
   });
+
+  it.each(['attach failure', 'sync failure', 'success', 'drain failure'] as const)(
+    'selects a queued persistence factory correctly after an earlier %s', async outcome => {
+      const test = fixture();
+      const ready = deferred<void>();
+      const failure = new Error('first recovery failed');
+      const destroy = vi.fn();
+      const original = vi.fn(async (doc: Document) => {
+        doc.insertText(0, 'original cache');
+        if (outcome === 'attach failure') await ready.promise;
+        return { whenSynced: ready.promise, destroy };
+      });
+      const replacement = vi.fn((doc: Document) => {
+        doc.insertText(doc.getText().length, ' replacement cache');
+        return { whenSynced: Promise.resolve(), destroy: vi.fn() };
+      });
+      if (outcome === 'drain failure') test.create.mockRejectedValueOnce(failure);
+      const first = test.open({ persistence: original });
+      const firstSettled = first.catch(error => error);
+      let second: ReturnType<typeof test.open> | undefined;
+      try {
+        await vi.waitFor(() => expect(original).toHaveBeenCalledOnce());
+        const retained = test.sessions.get('page');
+        second = test.open({ persistence: replacement });
+        void second.catch(() => {});
+        const replace = outcome === 'attach failure' || outcome === 'sync failure';
+        if (replace) ready.reject(failure);
+        else ready.resolve();
+        expect(await firstSettled).toBe(outcome === 'success' ? retained : failure);
+        const session = await second;
+        expect(session).toBe(retained);
+        expect(session.doc.getText()).toContain('original cache');
+        expect(session.doc.getText().includes('replacement cache')).toBe(replace);
+        expect(original).toHaveBeenCalledOnce();
+        expect(replacement).toHaveBeenCalledTimes(replace ? 1 : 0);
+        expect(destroy).toHaveBeenCalledTimes(outcome === 'sync failure' ? 1 : 0);
+        expect(session.doc.hasUnflushedChanges()).toBe(false);
+      } finally {
+        ready.resolve();
+        await Promise.allSettled([first, ...(second === undefined ? [] : [second])]);
+        await test.sessions.dispose();
+      }
+    },
+  );
 
   it('fences disposal immediately and awaits a late adapter and its asynchronous cleanup', async () => {
     const test = fixture();
@@ -346,6 +426,60 @@ describe('document recovery', () => {
 });
 
 describe('document authority and repair', () => {
+  it('returns a rejected open promise when demotion capture fails and still denies readonly writes', async () => {
+    const test = fixture();
+    try {
+      const session = await test.open();
+      session.doc.insertText(0, 'retained local');
+      const failure = new Error('capture failed');
+      vi.spyOn(session.writer, 'capturePendingUpdate').mockImplementationOnce(() => { throw failure; });
+      let opening: ReturnType<typeof test.open> | undefined;
+      expect(() => { opening = test.open({ writable: false }); }).not.toThrow();
+      await expect(opening).rejects.toBe(failure);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('retained local');
+      await expect(session.writer.drain()).rejects.toThrow();
+      expect(test.create).not.toHaveBeenCalled();
+    } finally {
+      await test.sessions.dispose();
+    }
+  });
+
+  it('retains a dirty document and its validated repair when applying the repair to that document fails', async () => {
+    vi.useFakeTimers();
+    const test = fixture();
+    const handoff = createYjs1Doc();
+    try {
+      const session = await test.open();
+      session.doc.insertText(0, 'existing draft');
+      test.sessions.stage('page', update('staged repair').data);
+      const apply = vi.spyOn(session.doc, 'applyLive').mockReturnValue({ applied: false, reason: 'invalid-payload' });
+      await expect(test.open()).rejects.toThrow('restore document changes');
+      expect(test.sessions.get('page')).toBe(session);
+      const before = session.doc.encodeFullState();
+      const captured = test.sessions.capturePending();
+      expect(captured).toHaveLength(1);
+      expect(handoff.applyLive(captured[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toContain('existing draft');
+      expect(handoff.getText()).toContain('staged repair');
+      expect(session.doc.encodeFullState()).toEqual(before);
+      expect(session.doc.getText()).toBe('existing draft');
+      expect(apply).toHaveBeenCalledOnce();
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(DocumentNotReadyError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(DocumentNotReadyError);
+      expect(test.create).not.toHaveBeenCalled();
+      apply.mockRestore();
+      expect(await test.open()).toBe(session);
+      await test.sessions.drainAll();
+      expect(session.doc.getText()).toContain('existing draft');
+      expect(session.doc.getText()).toContain('staged repair');
+      expect(test.sessions.hasPending()).toBe(false);
+    } finally {
+      handoff.destroy();
+      await test.sessions.dispose();
+    }
+  });
+
   it.each(['drain', 'close', 'pending close'] as const)('preserves acknowledged edits across %s after demotion', async barrier => {
     const test = fixture();
     const accepted = deferred<{ id: string; timestamp: string }>();

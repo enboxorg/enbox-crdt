@@ -40,7 +40,12 @@ export interface OpenDocumentSessionOptions<Document extends CollabDoc> {
   persistence?(doc: Document, signal: AbortSignal): DocumentPersistence | Promise<DocumentPersistence>;
 }
 
-/** Lifecycle notifications begin with opened; failed initial opens emit none. */
+/**
+ * Notifications, not a complete state machine. Closing announces an attempt;
+ * its promise may reject while the handle remains retained. Disposed means
+ * ownership is fenced; the operation's promise awaits adapter cleanup.
+ * Failed initial opens emit none.
+ */
 export interface DocumentLifecycleEvent<Document extends CollabDoc, Awareness extends { destroy(): void }> {
   key: string;
   phase: 'opened' | 'closing' | 'disposed';
@@ -49,7 +54,7 @@ export interface DocumentLifecycleEvent<Document extends CollabDoc, Awareness ex
 
 /** Shared factories and writer cadence for one set of documents. */
 export interface DocumentSessionsOptions<Document extends CollabDoc, Awareness extends { destroy(): void }> {
-  /** Create fresh in-memory handles; also used temporarily to validate staged repairs. */
+  /** Create a fresh empty in-memory document; also used to validate/combine repair frames. */
   createDocument(): { doc: Document; awareness: Awareness };
   timers: DurableWriterTimers;
   clock?: DurableWriterClock;
@@ -86,6 +91,7 @@ type Entry<Document extends CollabDoc, Awareness extends { destroy(): void }> = 
   published: boolean;
   retired: boolean;
   suspended: boolean;
+  localChanges: boolean;
   tail: Promise<void>;
   closing?: CloseAttempt;
   detachLocal?: () => void;
@@ -132,57 +138,65 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
    * Concurrent calls share creation. Later recovery requests are honored even when
    * hydration is pending. A missing persistence option never detaches an existing adapter.
    * Authority changes take effect at invocation; queued setup uses the latest binding.
+   * Every failure rejects the returned promise, including synchronous preparation errors.
    */
-  open(key: string, options: OpenDocumentSessionOptions<Document>): Promise<DocumentSession<Document, Awareness>> {
-    if (this.disposed) return Promise.reject(retiredError());
+  async open(key: string, options: OpenDocumentSessionOptions<Document>): Promise<DocumentSession<Document, Awareness>> {
+    if (this.disposed) throw retiredError();
     const binding: Binding = { create: options.create, writable: options.writable, canSquash: options.canSquash };
     let entry = this.entries.get(key);
     if (entry === undefined) {
       entry = {
         key, abort: new AbortController(), binding, initialized: false,
-        published: false, retired: false, suspended: true, tail: Promise.resolve(), recovered: false,
+        published: false, retired: false, suspended: true, localChanges: false,
+        tail: Promise.resolve(), recovered: false,
       };
       this.entries.set(key, entry);
     }
     const owned = entry;
     const wasWritable = owned.binding.writable;
     owned.binding = binding;
+    if (wasWritable && !binding.writable && owned.session?.writer.capturePendingUpdate() !== undefined) {
+      owned.localChanges = true;
+    }
     const previousClose = owned.closing;
     owned.closing = undefined;
     owned.session?.writer.setCanSquash(options.canSquash);
-    if (options.persistence !== undefined && (owned.persistenceFactory === undefined
-      || (!owned.recovered && owned.persistencePending === undefined))) {
-      owned.persistenceFactory = options.persistence;
+    if (options.persistence !== undefined && !owned.recovered) {
+      owned.persistenceFactory ??= options.persistence;
       owned.suspended = true;
-      owned.detachLocal?.();
-      owned.detachLocal = undefined;
     }
     const opening = owned.tail.then(async () => {
-      this.assertCurrent(owned);
-      if (!owned.initialized) await this.initialize(owned, options.load, options.updates);
-      else for (const { data, ...meta } of options.updates ?? []) owned.session!.writer.applyDurable(data, meta);
-      this.assertCurrent(owned);
-      const session = owned.session!;
-      this.applyStaged(owned);
-      if (owned.persistenceFactory !== undefined && !owned.recovered) {
-        // Reclaim before waiting so an older close cannot destroy the recovered document.
-        await previousClose?.promise.catch(() => {});
-        await this.recover(owned);
-      } else {
-        owned.suspended = false;
+      try {
+        this.assertCurrent(owned);
+        if (!owned.initialized) await this.initialize(owned, options.load, options.updates);
+        else for (const { data, ...meta } of options.updates ?? []) owned.session!.writer.applyDurable(data, meta);
+        this.assertCurrent(owned);
+        // A queued request can replace a failed attachment, never a successful one.
+        if (options.persistence !== undefined && !owned.recovered && owned.persistencePending === undefined) {
+          owned.persistenceFactory = options.persistence;
+        }
+        this.applyStaged(owned);
+        if (owned.persistenceFactory !== undefined && !owned.recovered) {
+          // Reclaim before waiting so an older close cannot destroy the recovered document.
+          await previousClose?.promise.catch(() => {});
+          await this.recover(owned);
+        } else {
+          owned.suspended = false;
+        }
+        this.assertCurrent(owned);
+        if (!owned.published || previousClose !== undefined) {
+          owned.published = true;
+          this.emit(owned, 'opened');
+        }
+        this.assertCurrent(owned);
+        return owned.session!;
+      } catch (error) {
+        // Do not erase valid local state or repair bytes when setup cannot finish.
+        if (this.isCurrent(owned)) owned.suspended = true;
+        throw error;
       }
-      this.assertCurrent(owned);
-      this.attachLocal(owned);
-      if (!owned.published || previousClose !== undefined) {
-        owned.published = true;
-        this.emit(owned, 'opened');
-      }
-      this.assertCurrent(owned);
-      return session;
     });
     owned.tail = opening.then(() => {}, () => {});
-    // Publish setup ownership before retaining repairs can notify document listeners.
-    if (wasWritable && !binding.writable) this.retainPending(owned);
     return opening;
   }
 
@@ -215,8 +229,9 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   /**
    * Join opening work, drain and dispose. Unconfirmed read-only local/repair changes
    * reject with PendingDocumentChangesError; incomplete recovery rejects with
-   * DocumentNotReadyError. Failure retains the exact handle for retry. An intervening
-   * open reclaims it and fences this close's finalizer.
+   * DocumentNotReadyError. Failures before retirement retain the exact handle for
+   * retry; adapter cleanup can reject after ownership is already fenced. An
+   * intervening open reclaims the handle and fences this close's finalizer.
    */
   close(key: string): Promise<void> {
     const entry = this.entries.get(key);
@@ -270,15 +285,22 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     return this.disposal;
   }
 
-  /** Copy writable residuals and already-staged changes for a fresh authority owner. */
+  /** Copy writable/local residuals and staged repairs, including incomplete recovery. */
   capturePending(): Array<{ key: string; update: Uint8Array }> {
     for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
     const pending = new Map(this.staged);
     for (const entry of this.entries.values()) {
-      if (pending.has(entry.key) && this.staged.get(entry.key) !== entry.appliedStage) continue;
-      if (entry.binding.writable || pending.has(entry.key)) {
+      if (entry.binding.writable || entry.localChanges || pending.has(entry.key)) {
         const update = entry.session?.writer.capturePendingUpdate();
-        if (update !== undefined) pending.set(entry.key, update);
+        if (update !== undefined) {
+          const staged = pending.get(entry.key);
+          pending.set(entry.key, staged !== undefined && staged !== entry.appliedStage
+            ? this.withTemporaryDocument(doc => {
+              this.applyUpdate(doc, { data: staged });
+              this.applyUpdate(doc, { data: update });
+              return doc.encodeFullState();
+            }) : update);
+        }
       }
     }
     return [...pending].map(([key, update]) => ({ key, update: Uint8Array.from(update) }));
@@ -291,19 +313,21 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   stage(key: string, update: Uint8Array): void {
     if (this.disposed) throw retiredError();
     const copy = Uint8Array.from(update);
-    const { doc, awareness } = this.options.createDocument();
-    try {
+    this.withTemporaryDocument(doc => {
       const result = doc.applyLive(copy);
       if (!result.applied) throw new TypeError(`Invalid staged document update: ${result.reason}`);
-    } finally {
-      try { awareness.destroy(); } finally { doc.destroy(); }
-    }
+    });
     this.staged.set(key, copy);
   }
 
-  /** Whether writable or staged state remains beyond known durable storage. */
+  /** Whether writable/local or staged state remains beyond known durable storage. */
   hasPending(): boolean {
-    return this.capturePending().length > 0;
+    for (const entry of this.entries.values()) this.clearConfirmedStage(entry);
+    if (this.staged.size > 0) return true;
+    for (const entry of this.entries.values()) {
+      if ((entry.binding.writable || entry.localChanges) && entry.session?.writer.capturePendingUpdate() !== undefined) return true;
+    }
+    return false;
   }
 
   private async initialize(
@@ -329,6 +353,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
         onParentGone: () => this.options.onParentGone?.(entry.key),
       });
       entry.session = Object.freeze({ doc, writer, awareness });
+      this.attachLocal(entry);
       const updates = load === undefined ? [] : await this.wait(entry, load(entry.abort.signal));
       this.assertCurrent(entry);
       for (const update of updates ?? []) this.applyUpdate(doc, update);
@@ -343,8 +368,6 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   private async recover(entry: Entry<Document, Awareness>): Promise<void> {
     const session = entry.session!;
     entry.suspended = true;
-    entry.detachLocal?.();
-    entry.detachLocal = undefined;
     // Settle an issued write; the dispatch guard prevents another write before recovery.
     await session.writer.flush();
     this.assertCurrent(entry);
@@ -374,7 +397,6 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     entry.suspended = false;
     try {
       if (entry.binding.writable) await session.writer.drain();
-      else this.retainPending(entry);
       this.assertCurrent(entry);
       entry.recovered = true;
     } catch (error) {
@@ -395,6 +417,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     const result = entry.session!.doc.applyLive(update);
     if (!result.applied) throw new Error(`Unable to restore document changes: ${result.reason}`);
     entry.appliedStage = update;
+    entry.localChanges = true;
     if (entry.binding.writable) {
       this.staged.delete(entry.key);
       entry.appliedStage = undefined;
@@ -402,34 +425,22 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     }
   }
 
-  private retainPending(entry: Entry<Document, Awareness>): void {
-    const previous = this.staged.get(entry.key);
-    // Preserve a queued repair as well as new read-only edits in one recovery frame.
-    if (previous !== undefined && previous !== entry.appliedStage) {
-      if (!entry.initialized) return;
-      this.applyStaged(entry);
-    }
-    const update = entry.session?.writer.capturePendingUpdate();
-    if (update !== undefined) {
-      this.staged.set(entry.key, update);
-      entry.appliedStage = update;
-    }
-  }
-
   private clearConfirmedStage(entry: Entry<Document, Awareness>): void {
-    if (this.isCurrent(entry) && entry.appliedStage !== undefined
-      && entry.appliedStage === this.staged.get(entry.key) && !entry.session!.writer.isDisposed
-      && entry.session!.writer.capturePendingUpdate() === undefined) {
-      this.staged.delete(entry.key);
-      entry.appliedStage = undefined;
+    if (this.isCurrent(entry) && entry.session !== undefined && !entry.session.writer.isDisposed
+      && entry.session.writer.capturePendingUpdate() === undefined) {
+      entry.localChanges = false;
+      if (entry.appliedStage !== undefined && entry.appliedStage === this.staged.get(entry.key)) {
+        this.staged.delete(entry.key);
+        entry.appliedStage = undefined;
+      }
     }
   }
 
   private attachLocal(entry: Entry<Document, Awareness>): void {
     entry.detachLocal ??= entry.session!.doc.onLocalUpdate(() => {
-      if (!this.isCurrent(entry) || entry.suspended) return;
-      if (entry.binding.writable) entry.session!.writer.onLocalChange();
-      else this.retainPending(entry);
+      if (!this.isCurrent(entry)) return;
+      entry.localChanges = true;
+      if (entry.binding.writable && !entry.suspended) entry.session!.writer.onLocalChange();
     });
   }
 
@@ -446,7 +457,17 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     if (!this.isCurrent(entry)) return;
     if (entry.suspended) throw new DocumentNotReadyError();
     this.clearConfirmedStage(entry);
-    if (this.staged.has(entry.key)) throw new PendingDocumentChangesError();
+    if (this.staged.has(entry.key) || (!entry.binding.writable && entry.localChanges)) {
+      throw new PendingDocumentChangesError();
+    }
+  }
+
+  /** Validate or combine repairs without mutating the retained live document. */
+  private withTemporaryDocument<Value>(operation: (doc: Document) => Value): Value {
+    const { doc, awareness } = this.options.createDocument();
+    try { return operation(doc); } finally {
+      try { awareness.destroy(); } finally { doc.destroy(); }
+    }
   }
 
   private isCurrent(entry: Entry<Document, Awareness>): boolean {
@@ -487,7 +508,6 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     this.pendingCleanup.add(cleanup.promise);
     const settled = (): void => { this.pendingCleanup.delete(cleanup.promise); };
     void cleanup.promise.then(settled, settled);
-    this.clearConfirmedStage(entry);
     entry.retired = true;
     if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
     const cleanups: Promise<void>[] = [];
