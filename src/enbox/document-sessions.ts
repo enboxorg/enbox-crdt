@@ -8,7 +8,11 @@ export interface DurableDocumentUpdate extends DurableDeltaMeta {
   data: Uint8Array;
 }
 
-/** The existing persistence adapter lifecycle needed during document recovery. */
+/**
+ * Local persistence: whenSynced is the initial recovery barrier. Later cache
+ * merges enter the document's local-update feed and are saved or retained under
+ * its current write policy. Network records/frames must use applyDurable/applyLive.
+ */
 export interface DocumentPersistence {
   readonly whenSynced: Promise<void>;
   destroy(): void | Promise<void>;
@@ -25,6 +29,7 @@ export interface DocumentSession<Document extends CollabDoc, Awareness extends {
 /** Native write authority and optional hydration/recovery for one logical document. */
 export interface OpenDocumentSessionOptions<Document extends CollabDoc> {
   create: DurableWriterOptions['create'];
+  /** Gates native writes; local mutations remain possible and are retained while false. */
   writable: boolean;
   canSquash: boolean;
   /** Queried only when creating the document, with an owner-controlled lifetime signal. */
@@ -35,7 +40,7 @@ export interface OpenDocumentSessionOptions<Document extends CollabDoc> {
   persistence?(doc: Document, signal: AbortSignal): DocumentPersistence | Promise<DocumentPersistence>;
 }
 
-/** Notifications describe ownership changes, without choosing application UI policy. */
+/** Lifecycle notifications begin with opened; failed initial opens emit none. */
 export interface DocumentLifecycleEvent<Document extends CollabDoc, Awareness extends { destroy(): void }> {
   key: string;
   phase: 'opened' | 'closing' | 'disposed';
@@ -44,6 +49,7 @@ export interface DocumentLifecycleEvent<Document extends CollabDoc, Awareness ex
 
 /** Shared factories and writer cadence for one set of documents. */
 export interface DocumentSessionsOptions<Document extends CollabDoc, Awareness extends { destroy(): void }> {
+  /** Create fresh in-memory handles; also used temporarily to validate staged repairs. */
   createDocument(): { doc: Document; awareness: Awareness };
   timers: DurableWriterTimers;
   clock?: DurableWriterClock;
@@ -53,11 +59,19 @@ export interface DocumentSessionsOptions<Document extends CollabDoc, Awareness e
   onParentGone?(key: string): void;
 }
 
-/** A durability barrier cannot discard staged changes that still need writable access. */
+/** Pending authored or recovered changes cannot be saved without writable access. */
 export class PendingDocumentChangesError extends Error {
   constructor() {
-    super('Staged document changes need writable access before they can be drained.');
+    super('Pending document changes require writable access before they can be saved.');
     this.name = 'PendingDocumentChangesError';
+  }
+}
+
+/** Hydration or local recovery has not completed successfully. Retry open before draining. */
+export class DocumentNotReadyError extends Error {
+  constructor() {
+    super('Document hydration or recovery has not completed successfully.');
+    this.name = 'DocumentNotReadyError';
   }
 }
 
@@ -84,8 +98,6 @@ type Entry<Document extends CollabDoc, Awareness extends { destroy(): void }> = 
   cleanup?: Promise<void>;
 };
 
-class WriteUnavailableError extends Error {}
-
 function deferredCleanup() {
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
@@ -103,6 +115,8 @@ function retiredError(): Error {
  * Own keyed collaborative documents through hydration, recovery, close and reclaim.
  * Each document has one writer and one local-update listener. Failed close or
  * recovery retains its state; discard/dispose explicitly abandon it.
+ * Setup is serialized. Authority changes, reclaim and discard fence work immediately;
+ * graceful drains use the writer's serialization and cannot finalize a reclaimed entry.
  */
 export class DocumentSessions<Document extends CollabDoc, Awareness extends { destroy(): void }> {
   private readonly entries = new Map<string, Entry<Document, Awareness>>();
@@ -117,25 +131,24 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
    * Open or reclaim one document, rebinding future writes to the supplied authority.
    * Concurrent calls share creation. Later recovery requests are honored even when
    * hydration is pending. A missing persistence option never detaches an existing adapter.
+   * Authority changes take effect at invocation; queued setup uses the latest binding.
    */
   open(key: string, options: OpenDocumentSessionOptions<Document>): Promise<DocumentSession<Document, Awareness>> {
     if (this.disposed) return Promise.reject(retiredError());
     const binding: Binding = { create: options.create, writable: options.writable, canSquash: options.canSquash };
     let entry = this.entries.get(key);
-    const demoted = entry?.binding.writable === true && !binding.writable;
     if (entry === undefined) {
       entry = {
         key, abort: new AbortController(), binding, initialized: false,
         published: false, retired: false, suspended: true, tail: Promise.resolve(), recovered: false,
       };
       this.entries.set(key, entry);
-    } else if (demoted) {
-      this.retainPending(entry);
     }
     const owned = entry;
+    const wasWritable = owned.binding.writable;
+    owned.binding = binding;
     const previousClose = owned.closing;
     owned.closing = undefined;
-    owned.binding = binding;
     owned.session?.writer.setCanSquash(options.canSquash);
     if (options.persistence !== undefined && (owned.persistenceFactory === undefined
       || (!owned.recovered && owned.persistencePending === undefined))) {
@@ -151,7 +164,6 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
       this.assertCurrent(owned);
       const session = owned.session!;
       this.applyStaged(owned);
-      if (demoted && !owned.binding.writable) this.retainPending(owned);
       if (owned.persistenceFactory !== undefined && !owned.recovered) {
         // Reclaim before waiting so an older close cannot destroy the recovered document.
         await previousClose?.promise.catch(() => {});
@@ -169,6 +181,8 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
       return session;
     });
     owned.tail = opening.then(() => {}, () => {});
+    // Publish setup ownership before retaining repairs can notify document listeners.
+    if (wasWritable && !binding.writable) this.retainPending(owned);
     return opening;
   }
 
@@ -194,16 +208,15 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
   /** Strictly drain one writable document; staged read-only changes remain actionable. */
   async drain(key: string): Promise<void> {
     const entry = this.entries.get(key);
-    if (entry !== undefined) {
-      await this.drainEntry(entry);
-      this.clearConfirmedStage(entry);
-    }
+    if (entry !== undefined) await this.drainEntry(entry);
     if (this.staged.has(key)) throw new PendingDocumentChangesError();
   }
 
   /**
-   * Join opening work, drain and dispose. Failure rejects and retains the exact
-   * handle for retry. An intervening open reclaims it and fences this close's finalizer.
+   * Join opening work, drain and dispose. Unconfirmed read-only local/repair changes
+   * reject with PendingDocumentChangesError; incomplete recovery rejects with
+   * DocumentNotReadyError. Failure retains the exact handle for retry. An intervening
+   * open reclaims it and fences this close's finalizer.
    */
   close(key: string): Promise<void> {
     const entry = this.entries.get(key);
@@ -214,9 +227,10 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     const opening = entry.tail;
     attempt.promise = opening.then(async () => {
       if (!this.isCurrent(entry) || entry.closing !== attempt) return;
-      if (!entry.initialized || entry.suspended) throw new PendingDocumentChangesError();
+      if (!entry.initialized || entry.suspended) throw new DocumentNotReadyError();
       this.emit(entry, 'closing');
-      if (entry.binding.writable) await entry.session!.writer.drain();
+      if (!this.isCurrent(entry) || entry.closing !== attempt) return;
+      await this.drainReady(entry);
       if (entry.closing === attempt && this.isCurrent(entry)) await this.remove(entry, false);
     });
     // Retain failures without leaking a rejection when a host closes in the background.
@@ -270,10 +284,21 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     return [...pending].map(([key, update]) => ({ key, update: Uint8Array.from(update) }));
   }
 
-  /** Retain a repair frame until open can merge it into a hydrated document. */
+  /**
+   * Validate and copy a repair frame before retaining it. Validation uses a
+   * temporary document from createDocument; invalid input leaves existing state intact.
+   */
   stage(key: string, update: Uint8Array): void {
     if (this.disposed) throw retiredError();
-    this.staged.set(key, Uint8Array.from(update));
+    const copy = Uint8Array.from(update);
+    const { doc, awareness } = this.options.createDocument();
+    try {
+      const result = doc.applyLive(copy);
+      if (!result.applied) throw new TypeError(`Invalid staged document update: ${result.reason}`);
+    } finally {
+      try { awareness.destroy(); } finally { doc.destroy(); }
+    }
+    this.staged.set(key, copy);
   }
 
   /** Whether writable or staged state remains beyond known durable storage. */
@@ -292,11 +317,14 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
         doc, timers: this.options.timers, clock: this.options.clock, canSquash: entry.binding.canSquash,
         create: request => {
           this.assertCurrent(entry);
-          if (!entry.binding.writable || entry.suspended) throw new WriteUnavailableError('Document writes are unavailable.');
+          if (entry.suspended) throw new DocumentNotReadyError();
+          if (!entry.binding.writable) throw new PendingDocumentChangesError();
           return entry.binding.create(request);
         },
         onError: error => {
-          if (!(error instanceof WriteUnavailableError)) this.options.onError?.(entry.key, error);
+          if (!(error instanceof DocumentNotReadyError) && !(error instanceof PendingDocumentChangesError)) {
+            this.options.onError?.(entry.key, error);
+          }
         },
         onParentGone: () => this.options.onParentGone?.(entry.key),
       });
@@ -376,7 +404,11 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
 
   private retainPending(entry: Entry<Document, Awareness>): void {
     const previous = this.staged.get(entry.key);
-    if (previous !== undefined && previous !== entry.appliedStage) return;
+    // Preserve a queued repair as well as new read-only edits in one recovery frame.
+    if (previous !== undefined && previous !== entry.appliedStage) {
+      if (!entry.initialized) return;
+      this.applyStaged(entry);
+    }
     const update = entry.session?.writer.capturePendingUpdate();
     if (update !== undefined) {
       this.staged.set(entry.key, update);
@@ -395,16 +427,26 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
 
   private attachLocal(entry: Entry<Document, Awareness>): void {
     entry.detachLocal ??= entry.session!.doc.onLocalUpdate(() => {
-      if (this.isCurrent(entry) && entry.binding.writable && !entry.suspended) entry.session!.writer.onLocalChange();
+      if (!this.isCurrent(entry) || entry.suspended) return;
+      if (entry.binding.writable) entry.session!.writer.onLocalChange();
+      else this.retainPending(entry);
     });
   }
 
   private async drainEntry(entry: Entry<Document, Awareness>): Promise<void> {
     await entry.tail;
-    if (this.isCurrent(entry)) {
-      if (entry.suspended) throw new PendingDocumentChangesError();
-      if (entry.binding.writable) await entry.session?.writer.drain();
-    }
+    await this.drainReady(entry);
+  }
+
+  /** Shared barrier after setup; close already joined its captured opening work. */
+  private async drainReady(entry: Entry<Document, Awareness>): Promise<void> {
+    if (!this.isCurrent(entry)) return;
+    if (entry.suspended) throw new DocumentNotReadyError();
+    if (entry.binding.writable) await entry.session?.writer.drain();
+    if (!this.isCurrent(entry)) return;
+    if (entry.suspended) throw new DocumentNotReadyError();
+    this.clearConfirmedStage(entry);
+    if (this.staged.has(entry.key)) throw new PendingDocumentChangesError();
   }
 
   private isCurrent(entry: Entry<Document, Awareness>): boolean {
@@ -457,7 +499,7 @@ export class DocumentSessions<Document extends CollabDoc, Awareness extends { de
     if (entry.session !== undefined) {
       cleanups.push(this.cleanup(() => entry.session!.awareness.destroy()));
       cleanups.push(this.cleanup(() => entry.session!.doc.destroy()));
-      this.emit(entry, 'disposed');
+      if (entry.published) this.emit(entry, 'disposed');
     }
     void this.finishCleanup(cleanups).then(cleanup.resolve, cleanup.reject);
     return cleanup.promise;

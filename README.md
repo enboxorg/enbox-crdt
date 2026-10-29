@@ -96,25 +96,45 @@ upgrade temporarily suspends autosave during that recovery. Attachment failures
 can be retried; failed recovery writes retain the document and synced adapter.
 Omitting persistence on a subsequent open does not detach it.
 
+`whenSynced` marks the initial recovery barrier, not the end of all cache updates.
+For example, IndexedDB maintenance can later merge another tab's stored changes.
+Those unconfirmed cache changes use the local-update feed: writable sessions
+schedule a save and read-only sessions retain them for repair. Network transports
+must use `applyLive` or `writer.applyDurable` to preserve their distinct origins.
+
 `close` joins hydration and drains before disposing. A failed close rejects and
 retains the handle; reopen reclaims it, so an older close cannot destroy a newly
 claimed document. `get` and `values` include retained closing documents but hide
 incomplete hydration. `flush(key)` is best effort; `drain(key)` and `drainAll()`
 are strict barriers. Ordinary native operations already issued before an
 authority change keep their outcomes; future writes use the current target.
+Rebinding changes that target immediately, including while an older open is
+waiting. Hydration and recovery setup are serialized; discard cancels them
+immediately, and an older close cannot dispose a newly reclaimed handle.
 
 `capturePending()` copies writable residuals for authority repair. Call
-`stage(key, update)` on a fresh owner before opening with new authority. Staged
-changes survive read-only access and make durability barriers reject with
-`PendingDocumentChangesError`. Demoting a writable document also retains its
-pending changes; an always-readonly document's live traffic is not staged.
+`stage(key, update)` on a fresh owner before opening with new authority. It
+validates the whole frame with a temporary document before retaining it, so a
+malformed frame cannot replace a valid repair or poison the retained document.
+Staged changes survive read-only access. Demoting a writable document also
+retains its pending changes.
+
+`writable: false` controls native write dispatch; it does not make the exposed
+`CollabDoc` immutable. If application code edits that document, its local-update
+feed retains the changes without writing. Close and durability barriers reject
+with `PendingDocumentChangesError` until the changes are confirmed, writable
+authority is restored, or the host explicitly discards them. Ordinary read-only
+`applyLive` traffic is not staged. `DocumentNotReadyError` instead means hydration
+or recovery has not completed successfully; retry `open` before draining. These
+public errors also cover authority changes during a pending write/drain.
 
 `discard(key)` and `dispose()` explicitly abandon owned state: they fence handles
 and stop scheduling immediately, then await adapter cleanup. Cache data is kept
 unless `discard(key, { clearPersistence: true })` requests its deletion through
 the adapter. Call `drainAll()` before `dispose()` when shutdown must preserve
 pending changes. Lifecycle notifications report `opened` (new or reclaimed),
-`closing` and `disposed`; notification failures cannot change lifecycle outcomes.
+`closing` and `disposed`; failed initial opens emit no lifecycle notifications.
+Notification failures cannot change lifecycle outcomes.
 
 ## Document primitives
 

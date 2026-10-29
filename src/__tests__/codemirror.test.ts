@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { EditorState } from '@codemirror/state';
+import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -18,6 +18,44 @@ function observerCount(doc: object, event: string): number {
 }
 
 describe('yjs1 CodeMirror adapter', () => {
+  it('blocks retained undo and redo shortcuts in a replacement readonly view', () => {
+    const doc = createYjs1Doc();
+    const original = createCodeMirrorBinding(doc);
+    const editing = new EditorView({ state: EditorState.create({ extensions: [original.extension] }) });
+    editing.dispatch({ changes: { from: 0, insert: 'retained edit' } });
+    editing.destroy();
+    original.destroy();
+
+    const binding = createCodeMirrorBinding(doc);
+    const mode = new Compartment();
+    const view = new EditorView({ state: EditorState.create({ doc: doc.getText(), extensions: [
+      binding.extension, mode.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
+    ] }) });
+    const browser = view.dom.ownerDocument.defaultView!;
+    const shortcut = (key: string) => view.contentDOM.dispatchEvent(new browser.KeyboardEvent('keydown', {
+      key, ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    shortcut('z');
+    view.contentDOM.dispatchEvent(new browser.InputEvent('beforeinput', { inputType: 'historyUndo', bubbles: true, cancelable: true }));
+    expect(doc.getText()).toBe('retained edit');
+
+    // Explicit document history remains available; only the view's commands are gated.
+    binding.undoManager.undo();
+    expect(doc.getText()).toBe('');
+    shortcut('y');
+    view.contentDOM.dispatchEvent(new browser.InputEvent('beforeinput', { inputType: 'historyRedo', bubbles: true, cancelable: true }));
+    expect(doc.getText()).toBe('');
+
+    view.dispatch({ effects: mode.reconfigure([EditorState.readOnly.of(false), EditorView.editable.of(true)]) });
+    shortcut('y');
+    expect(doc.getText()).toBe('retained edit');
+    shortcut('z');
+    expect(doc.getText()).toBe('');
+    view.destroy();
+    binding.destroy();
+    doc.destroy();
+  });
+
   it('binds the configured text container and scopes undo to editor-local changes', () => {
     const doc = createYjs1Doc({ textKey: 'body' });
     doc.insertText(0, 'base');

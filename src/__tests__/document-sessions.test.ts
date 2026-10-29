@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { DocumentSessions, PendingDocumentChangesError } from '../enbox/index.js';
+import { DocumentNotReadyError, DocumentSessions, PendingDocumentChangesError } from '../enbox/index.js';
 import type { DocumentPersistence, DurableDocumentUpdate, OpenDocumentSessionOptions } from '../enbox/index.js';
+import { encodeEnvelope } from '../index.js';
 import { createYjs1Doc } from '../yjs1/index.js';
 import { createAwareness } from '../yjs1/awareness.js';
 
@@ -46,20 +47,26 @@ describe('document ownership', () => {
     const test = fixture();
     const pending = deferred<readonly DurableDocumentUpdate[]>();
     const load = vi.fn(() => pending.promise);
+    const readonlyCreate = vi.fn(async () => ({ id: 'readonly', timestamp }));
+    const freshCreate = vi.fn(async () => ({ id: 'fresh', timestamp }));
     const first = test.open({ load });
-    const second = test.open({ load });
+    const second = test.open({ load, create: readonlyCreate, writable: false });
+    const third = test.open({ load, create: freshCreate });
     await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
     expect(test.sessions.get('page')).toBeUndefined();
     expect([...test.sessions.values()]).toEqual([]);
     pending.resolve([update('seed')]);
     const session = await first;
     expect(await second).toBe(session);
+    expect(await third).toBe(session);
     expect(test.createDocument).toHaveBeenCalledOnce();
     expect(session.doc.getText()).toBe('seed');
     expect(test.onLifecycle.mock.calls.map(([event]) => event.phase)).toEqual(['opened']);
     session.doc.insertText(4, ' edit');
     await vi.advanceTimersByTimeAsync(20);
-    expect(test.create).toHaveBeenCalledOnce();
+    expect(freshCreate).toHaveBeenCalledOnce();
+    expect(readonlyCreate).not.toHaveBeenCalled();
+    expect(test.create).not.toHaveBeenCalled();
     await test.sessions.dispose();
   });
 
@@ -132,13 +139,22 @@ describe('document ownership', () => {
     await test.sessions.dispose();
   });
 
-  it('cleans up malformed initial updates and allows a fresh open', async () => {
+  it.each(['load failure', 'malformed initial update'] as const)('cleans up %s without publishing an unopened session', async failure => {
     const test = fixture();
-    await expect(test.open({ updates: [{ data: new Uint8Array([0]) }] })).rejects.toThrow('durable document update');
-    expect(test.sessions.get('page')).toBeUndefined();
-    const session = await test.open({ updates: [update('valid')] });
-    expect(session.doc.getText()).toBe('valid');
-    await test.sessions.dispose();
+    try {
+      const opening = failure === 'load failure'
+        ? test.open({ load: async () => { throw new Error('load failed'); } })
+        : test.open({ updates: [{ data: new Uint8Array([0]) }] });
+      await expect(opening).rejects.toThrow();
+      expect(test.sessions.get('page')).toBeUndefined();
+      expect(test.onLifecycle).not.toHaveBeenCalled();
+      expect(() => test.createDocument.mock.results[0]!.value.doc.getText()).toThrow('destroyed');
+      const session = await test.open({ updates: [update('valid')] });
+      expect(session.doc.getText()).toBe('valid');
+      expect(test.onLifecycle.mock.calls.map(([event]) => event.phase)).toEqual(['opened']);
+    } finally {
+      await test.sessions.dispose();
+    }
   });
 
   it('does not let an older drain-all finalize a newly started close', async () => {
@@ -330,7 +346,7 @@ describe('document recovery', () => {
 });
 
 describe('document authority and repair', () => {
-  it.each(['drain', 'close'] as const)('clears an acknowledged demotion residual before %s completes', async barrier => {
+  it.each(['drain', 'close', 'pending close'] as const)('preserves acknowledged edits across %s after demotion', async barrier => {
     const test = fixture();
     const accepted = deferred<{ id: string; timestamp: string }>();
     test.create.mockImplementationOnce(() => accepted.promise);
@@ -340,12 +356,20 @@ describe('document authority and repair', () => {
     await vi.waitFor(() => expect(test.create).toHaveBeenCalledOnce());
     await test.open({ writable: false });
     expect(test.sessions.hasPending()).toBe(true);
+    if (barrier === 'pending close') {
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('accepted');
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      expect(test.sessions.get('page')).toBe(session);
+    }
     accepted.resolve({ id: 'accepted', timestamp });
     await draining;
     expect(session.doc.hasUnflushedChanges()).toBe(false);
     if (barrier === 'close') await test.sessions.close('page');
     expect(test.sessions.hasPending()).toBe(false);
     await test.sessions.drainAll();
+    if (barrier === 'pending close') expect(test.sessions.get('page')).toBeUndefined();
     await test.sessions.dispose();
   });
 
@@ -379,18 +403,28 @@ describe('document authority and repair', () => {
     expect(test.create).not.toHaveBeenCalled();
     expect(test.sessions.hasPending()).toBe(true);
     await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(PendingDocumentChangesError);
-    await test.sessions.close('page');
+    await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+    expect(test.sessions.get('page')).toBe(session);
     expect(test.sessions.capturePending()).toHaveLength(1);
     await test.sessions.dispose();
   });
 
-  it('blocks readonly durability barriers when cache recovery is unresolved', async () => {
+  it.each([false, true])('reports unresolved recovery separately from pending access when writable=%s', async writable => {
     const test = fixture();
-    await expect(test.open({ writable: false, persistence: async () => { throw new Error('cache unreadable'); } }))
-      .rejects.toThrow('cache unreadable');
-    await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(PendingDocumentChangesError);
-    expect(test.create).not.toHaveBeenCalled();
-    await test.sessions.dispose();
+    const failure = new Error('cache unreadable');
+    try {
+      await expect(test.open({ writable, persistence: async () => { throw failure; } })).rejects.toBe(failure);
+      const session = test.sessions.get('page');
+      expect(session).toBeDefined();
+      expect(test.sessions.hasPending()).toBe(false);
+      await expect(test.sessions.drain('page')).rejects.toBeInstanceOf(DocumentNotReadyError);
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(DocumentNotReadyError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(DocumentNotReadyError);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(test.create).not.toHaveBeenCalled();
+    } finally {
+      await test.sessions.dispose();
+    }
   });
 
   it('retains pending edits through demotion without writing, then uses fresh authority after rebind', async () => {
@@ -423,6 +457,151 @@ describe('document authority and repair', () => {
     await test.sessions.close('page');
     expect(test.create).not.toHaveBeenCalled();
     await test.sessions.dispose();
+  });
+
+  it.each(['grant', 'discard'] as const)('retains local edits made while readonly until an explicit %s', async action => {
+    vi.useFakeTimers();
+    const test = fixture();
+    try {
+      const session = await test.open({ writable: false });
+      session.doc.insertText(0, 'readonly local edit');
+      await vi.advanceTimersByTimeAsync(200);
+      expect(test.create).not.toHaveBeenCalled();
+      expect(test.sessions.hasPending()).toBe(true);
+      expect(test.sessions.capturePending()).toHaveLength(1);
+      await expect(test.sessions.drainAll()).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('readonly local edit');
+      if (action === 'grant') {
+        const create = vi.fn(async () => ({ id: 'fresh', timestamp }));
+        expect(await test.open({ create })).toBe(session);
+        await test.sessions.drainAll();
+        expect(create).toHaveBeenCalledOnce();
+        expect(test.create).not.toHaveBeenCalled();
+        await test.sessions.close('page');
+      } else {
+        await test.sessions.discard('page');
+        expect(test.create).not.toHaveBeenCalled();
+      }
+      expect(test.sessions.hasPending()).toBe(false);
+      expect(test.sessions.get('page')).toBeUndefined();
+    } finally {
+      await test.sessions.dispose();
+    }
+  });
+
+  it('retains a readonly local edit made by a closing notification', async () => {
+    const test = fixture();
+    const handoff = createYjs1Doc();
+    try {
+      const session = await test.open({ writable: false });
+      test.onLifecycle.mockImplementation(({ phase, session: current }) => {
+        if (phase === 'closing') current.doc.insertText(0, 'closing edit');
+      });
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('closing edit');
+      const pending = test.sessions.capturePending();
+      expect(pending).toHaveLength(1);
+      expect(handoff.applyLive(pending[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toBe('closing edit');
+      expect(test.create).not.toHaveBeenCalled();
+    } finally {
+      handoff.destroy();
+      await test.sessions.dispose();
+    }
+  });
+
+  it('retains both an unapplied repair and a later readonly local edit through handoff and regrant', async () => {
+    const test = fixture();
+    const handoff = createYjs1Doc();
+    const persisted = createYjs1Doc();
+    try {
+      const session = await test.open({ writable: false });
+      test.sessions.stage('page', update('staged repair').data);
+      session.doc.insertText(0, 'new local');
+      const captured = test.sessions.capturePending();
+      expect(captured).toHaveLength(1);
+      expect(handoff.applyLive(captured[0]!.update).applied).toBe(true);
+      expect(handoff.getText()).toContain('staged repair');
+      expect(handoff.getText()).toContain('new local');
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      expect(test.sessions.get('page')).toBe(session);
+      const create = vi.fn<OpenDocumentSessionOptions<Document>['create']>(async request => {
+        persisted.applyDurable(request.data);
+        return { id: 'fresh', timestamp };
+      });
+      expect(await test.open({ create })).toBe(session);
+      await test.sessions.drainAll();
+      expect(test.create).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledOnce();
+      expect(persisted.getText()).toContain('staged repair');
+      expect(persisted.getText()).toContain('new local');
+      expect(test.sessions.hasPending()).toBe(false);
+    } finally {
+      handoff.destroy();
+      persisted.destroy();
+      await test.sessions.dispose();
+    }
+  });
+
+  it.each(['writer drain', 'close', 'drain all'] as const)('uses the public pending-changes error if access changes during %s', async barrier => {
+    const test = fixture();
+    const accepted = deferred<{ id: string; timestamp: string }>();
+    test.create.mockImplementationOnce(() => accepted.promise);
+    try {
+      const session = await test.open();
+      session.doc.insertText(0, 'first');
+      const draining = barrier === 'writer drain' ? session.writer.drain()
+        : barrier === 'close' ? test.sessions.close('page') : test.sessions.drainAll();
+      const rejected = expect(draining).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      await vi.waitFor(() => expect(test.create).toHaveBeenCalledOnce());
+      session.doc.insertText(5, ' later');
+      await test.open({ writable: false });
+      accepted.resolve({ id: 'first', timestamp });
+      await rejected;
+      expect(test.onError).not.toHaveBeenCalled();
+      expect(test.sessions.get('page')).toBe(session);
+      expect(test.sessions.hasPending()).toBe(true);
+      const create = vi.fn(async () => ({ id: 'fresh', timestamp }));
+      await test.open({ create });
+      await test.sessions.drainAll();
+      expect(create).toHaveBeenCalledOnce();
+      expect(test.create).toHaveBeenCalledOnce();
+      expect(test.sessions.hasPending()).toBe(false);
+    } finally {
+      accepted.resolve({ id: 'first', timestamp });
+      await test.sessions.dispose();
+    }
+  });
+
+  it.each([
+    ['bad header', new Uint8Array([0])],
+    ['wrong format', encodeEnvelope('loro1', new Uint8Array([0, 0]))],
+    ['corrupt payload', encodeEnvelope('yjs1', new Uint8Array([255]))],
+  ] as const)('rejects a staged %s without replacing valid repair or live changes', async (_reason, invalid) => {
+    const test = fixture();
+    try {
+      const session = await test.open();
+      session.doc.insertText(0, 'existing local');
+      test.sessions.stage('page', update('valid repair').data);
+      const captured = test.sessions.capturePending();
+      expect(() => test.sessions.stage('page', invalid)).toThrow();
+      expect(test.sessions.capturePending()).toEqual(captured);
+      expect(test.sessions.get('page')).toBe(session);
+      expect(session.doc.getText()).toBe('existing local');
+      const temporary = test.createDocument.mock.results.at(-1)!.value;
+      expect(() => temporary.doc.getText()).toThrow('destroyed');
+      expect(() => temporary.awareness.getLocalState()).toThrow('destroyed');
+      expect(await test.open()).toBe(session);
+      expect(session.doc.getText()).toContain('existing local');
+      expect(session.doc.getText()).toContain('valid repair');
+      await test.sessions.drainAll();
+      expect(test.sessions.hasPending()).toBe(false);
+    } finally {
+      await test.sessions.dispose();
+    }
   });
 
   it('retains staged edits with read-only access and drains them only after a writable rebind', async () => {
