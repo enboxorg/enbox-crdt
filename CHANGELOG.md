@@ -1,5 +1,15 @@
 # @enbox/crdt
 
+## 0.2.0
+
+### Minor Changes
+
+- [#10](https://github.com/enboxorg/enbox-crdt/pull/10) [`8501f22`](https://github.com/enboxorg/enbox-crdt/commit/8501f22b70af7b243cfc66d81467c0255b718213) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Add DocumentSessions to own collaborative documents through hydration, optional local-cache recovery, autosave, close and reclaim. Preserve failed drains and pending changes across fresh write authority, await adapter cleanup, and keep the existing document and durable-writer primitives available for custom lifecycles.
+
+  Validate staged repairs before accepting them, retain read-only local edits, and distinguish pending changes from incomplete recovery with public errors. CodeMirror undo and redo respect read-only views.
+
+  Keep terminal-writer repairs exportable and report a stopped writer consistently from managed durability barriers.
+
 ## 0.1.4
 
 ### Patch Changes
