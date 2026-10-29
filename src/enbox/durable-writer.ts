@@ -77,8 +77,8 @@ function failureFloor(error: unknown): string | undefined {
   try { addMicrosecondTick(floor); return floor; } catch { return undefined; }
 }
 
-/** Product notifications cannot change persistence outcomes or leak asynchronous rejections. */
-function notify(callback: () => void): void {
+/** @internal Product notifications cannot change persistence outcomes or leak rejections. */
+export function notify(callback: () => void): void {
   try { void Promise.resolve(callback()).catch(() => {}); } catch { /* Preserve the write's outcome. */ }
 }
 

@@ -10,8 +10,8 @@ The package provides:
 - a format-tagged delta envelope that lets readers reject unsupported data;
 - the pinned `yjs1` format implementation and its runtime dependency;
 - optional adapter subpaths for awareness, CodeMirror 6, and IndexedDB; and
-- Enbox/DWN helpers for squash backstops, write classification, and fresh
-  residual publication.
+- `DocumentSessions` for document ownership, hydration, optional recovery and
+  durable writing, with the underlying writer and planning helpers available.
 
 ## Install
 
@@ -29,7 +29,94 @@ the peer packages when using that subpath:
 npm install @codemirror/state @codemirror/view
 ```
 
-## Document lifecycle
+## Managed documents
+
+`DocumentSessions` from `@enbox/crdt/enbox` owns one document and writer per key.
+Bind native record writes and a loader that returns SDK frames with their record
+metadata. The document factory keeps the owner independent of its merge engine.
+The native bindings supply record authorization; the owner validates CRDT frames
+and gates dispatch with the current application write policy.
+
+```ts
+import { DocumentSessions } from '@enbox/crdt/enbox';
+import { createYjs1Doc } from '@enbox/crdt/yjs1';
+import { createAwareness } from '@enbox/crdt/yjs1/awareness';
+
+const documents = new DocumentSessions({
+  createDocument: () => {
+    const doc = createYjs1Doc();
+    return { doc, awareness: createAwareness(doc) };
+  },
+  timers: { idleMs: 2000, backstopMs: 30000, convergenceMs: 1000 },
+  onError: (key, error) => reportDocumentError(key, error),
+});
+
+const session = await documents.open(note.id, {
+  create: request => records.create('note/delta', {
+    ...request, parentContextId: note.contextId,
+  }),
+  writable: mayEdit,
+  canSquash: maySquash,
+  load: async signal => {
+    const page = await records.query('note/delta', {
+      within: note.contextId, pagination: { limit: 100 },
+    });
+    const updates = [];
+    for await (const record of page) {
+      signal.throwIfAborted();
+      updates.push({
+        data: await record.value(), recordId: record.id,
+        snapshot: record.squash === true, messageTimestamp: record.timestamp,
+      });
+    }
+    return updates;
+  },
+  // Optional; can also be supplied when reopening a headless document.
+  persistence: async (doc, signal) => {
+    const { createIndexedDbPersistence } = await import('@enbox/crdt/yjs1/indexeddb');
+    signal.throwIfAborted();
+    return createIndexedDbPersistence(`my-app:note:${note.id}`, doc);
+  },
+});
+
+if (mayEdit) session.doc.insertText(0, 'Hello'); // One managed listener schedules local writes.
+session.writer.applyDurable(frame, { recordId, snapshot, messageTimestamp });
+await documents.close(note.id);
+```
+
+`open` coalesces creation and returns the same handle while it is retained.
+`load` runs only for a new document; prefetched `updates` are applied on every
+open, including a rebind to fresh native write authority. Remote/live operations
+do not arm the local-change listener. Existing durable convergence and recovery
+semantics remain unchanged.
+
+An optional persistence adapter is attached once. Opening waits for `whenSynced`
+and a strict durability drain before enabling autosave. A later persistence
+upgrade temporarily suspends autosave during that recovery. Attachment failures
+can be retried; failed recovery writes retain the document and synced adapter.
+Omitting persistence on a subsequent open does not detach it.
+
+`close` joins hydration and drains before disposing. A failed close rejects and
+retains the handle; reopen reclaims it, so an older close cannot destroy a newly
+claimed document. `get` and `values` include retained closing documents but hide
+incomplete hydration. `flush(key)` is best effort; `drain(key)` and `drainAll()`
+are strict barriers. Ordinary native operations already issued before an
+authority change keep their outcomes; future writes use the current target.
+
+`capturePending()` copies writable residuals for authority repair. Call
+`stage(key, update)` on a fresh owner before opening with new authority. Staged
+changes survive read-only access and make durability barriers reject with
+`PendingDocumentChangesError`. Demoting a writable document also retains its
+pending changes; an always-readonly document's live traffic is not staged.
+
+`discard(key)` and `dispose()` explicitly abandon owned state: they fence handles
+and stop scheduling immediately, then await adapter cleanup. Cache data is kept
+unless `discard(key, { clearPersistence: true })` requests its deletion through
+the adapter. Call `drainAll()` before `dispose()` when shutdown must preserve
+pending changes. Lifecycle notifications report `opened` (new or reclaimed),
+`closing` and `disposed`; notification failures cannot change lifecycle outcomes.
+
+## Document primitives
 
 ```ts
 import { createYjs1Doc } from '@enbox/crdt/yjs1';
@@ -58,7 +145,7 @@ the shadow only after its write is acknowledged. Applying a snapshot replaces
 the shadow without discarding live-only work, so omitted operations become the
 next residual automatically.
 
-## Durable write coordination
+## Custom durable write coordination
 
 `DurableWriter` owns one serialized plan/write/commit sequence per document,
 including debounce, sustained-edit backstops, squash-conflict recovery, and
@@ -110,8 +197,11 @@ document, merge that frame with `applyLive()`, and construct a replacement write
 the document available for retry. `republishNow()` attempts the fresh residual
 after local-cache recovery; the application decides when editing may begin.
 `dispose()` stops scheduling without discarding or destroying the document.
-Applications choose when to subscribe to local changes and how to handle
-read-only access, failed drains, and terminal parent deletion.
+When using this primitive directly, applications choose when to subscribe to
+local changes and how to handle read-only access, failed drains, and terminal
+parent deletion. `DocumentSessions` owns document, listener, close and reclaim
+tasks for the managed path; its keyed `onParentGone` callback leaves application
+navigation and cache-deletion policy with the host.
 Notification callback failures do not replace write failures or reject a
 background flush.
 
@@ -280,7 +370,7 @@ available through the engine's `mergeDeltas` on `@enbox/crdt/yjs1/advanced`.
 | `@enbox/crdt/yjs1/awareness` | Ephemeral participant state and awareness codecs |
 | `@enbox/crdt/yjs1/codemirror` | CodeMirror 6 binding and neutral undo lifecycle |
 | `@enbox/crdt/yjs1/indexeddb` | Browser persistence lifecycle |
-| `@enbox/crdt/enbox` | Durable write coordination, DWN classification, and squash timestamp helpers |
+| `@enbox/crdt/enbox` | `DocumentSessions`, durable writers, DWN classification, and squash timestamp helpers |
 | `@enbox/crdt/live` | Transport-agnostic state-vector reconciliation |
 
 The wire-format contract and conformance fixtures are documented in
