@@ -1,5 +1,18 @@
 # @enbox/crdt
 
+## 0.3.0
+
+### Minor Changes
+
+- [#12](https://github.com/enboxorg/enbox-crdt/pull/12) [`d1cc998`](https://github.com/enboxorg/enbox-crdt/commit/d1cc9989fa6a81a0304acdcd4c6a5b6b2ba65a5a) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Replace CollabDoc.connectLiveSync with connectLive for local-update batching,
+  backpressure, authorized synchronization, optional cursor exchange, and automatic
+  detachment. Keep wireLiveSync as the lower-level reconciliation primitive.
+  Roll back partial synchronization attachments when channel setup fails.
+  Validate timer intervals and isolate broadcast failures from document edits and
+  durable-write scheduling.
+  Allow one live attachment per document and require borrowed awareness to outlive
+  the attachment.
+
 ## 0.2.0
 
 ### Minor Changes
