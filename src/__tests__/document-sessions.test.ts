@@ -124,6 +124,62 @@ describe('document ownership', () => {
     await test.sessions.dispose();
   });
 
+  it.each(['durable confirmation', 'write retry'] as const)('retries close without reopening after %s', async recovery => {
+    const test = fixture();
+    const failure = new Error('offline');
+    if (recovery === 'write retry') test.create.mockRejectedValueOnce(failure);
+    try {
+      const session = await test.open({ writable: recovery === 'write retry' });
+      session.doc.insertText(0, 'retained');
+      const first = test.sessions.close('page');
+      if (recovery === 'write retry') await expect(first).rejects.toBe(failure);
+      else {
+        await expect(first).rejects.toBeInstanceOf(PendingDocumentChangesError);
+        session.applyDurable(session.doc.encodeFullState(), { recordId: 'confirmed' });
+      }
+      expect(test.sessions.get('page')).toBe(session);
+      const second = test.sessions.close('page');
+      expect(second).not.toBe(first);
+      await second;
+      expect(test.sessions.get('page')).toBeUndefined();
+      expect(test.create).toHaveBeenCalledTimes(recovery === 'write retry' ? 2 : 0);
+    } finally { await test.sessions.dispose(); }
+  });
+
+  it('does not let an old close rejection erase a newer close waiting for reclaimed recovery', async () => {
+    const synced = deferred<void>();
+    const accepted = deferred<{ id: string; timestamp: string }>();
+    const persistence = vi.fn(() => ({ whenSynced: synced.promise, destroy: vi.fn() }));
+    const test = fixture(persistence);
+    const failure = new Error('old write failed');
+    test.create.mockImplementationOnce(() => accepted.promise);
+    const session = await test.open();
+    session.doc.insertText(0, 'retained');
+    const oldClose = test.sessions.close('page');
+    const oldFailure = expect(oldClose).rejects.toBe(failure);
+    let reopened: ReturnType<typeof test.open> | undefined;
+    let newerClose: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(test.create).toHaveBeenCalledOnce());
+      reopened = test.open({ recover: true });
+      newerClose = test.sessions.close('page');
+      accepted.reject(failure);
+      await oldFailure;
+      await vi.waitFor(() => expect(persistence).toHaveBeenCalledOnce());
+      expect(test.sessions.close('page')).toBe(newerClose);
+      synced.resolve();
+      expect(await reopened).toBe(session);
+      await newerClose;
+      expect(test.create).toHaveBeenCalledTimes(2);
+      expect(test.sessions.get('page')).toBeUndefined();
+    } finally {
+      accepted.reject(failure);
+      synced.resolve();
+      await Promise.allSettled([oldClose, ...(reopened === undefined ? [] : [reopened]), ...(newerClose === undefined ? [] : [newerClose])]);
+      await test.sessions.dispose();
+    }
+  });
+
   it('fences discard during an accepted write and a separate pending hydration', async () => {
     const test = fixture();
     const accepted = deferred<{ id: string; timestamp: string }>();
@@ -164,16 +220,20 @@ describe('document ownership', () => {
     }
   });
 
-  it('does not let an older drain-all finalize a newly started close', async () => {
+  it('does not let an older drain-all finalize a retried close request', async () => {
     const test = fixture();
     const accepted = deferred<{ id: string; timestamp: string }>();
-    test.create.mockImplementationOnce(() => accepted.promise);
+    const failure = new Error('first close failed');
+    test.create.mockRejectedValueOnce(failure).mockImplementationOnce(() => accepted.promise);
     const session = await test.open();
+    session.doc.insertText(0, 'confirmed');
+    await expect(test.sessions.close('page')).rejects.toBe(failure);
+    session.applyDurable(session.doc.encodeFullState(), { recordId: 'confirmed' });
     const all = test.sessions.drainAll();
     await Promise.resolve();
-    session.doc.insertText(0, 'new close');
+    session.doc.insertText(session.doc.getText().length, ' new close');
     const closing = test.sessions.close('page');
-    await vi.waitFor(() => expect(test.create).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(test.create).toHaveBeenCalledTimes(2));
     await all;
     expect(test.sessions.get('page')).toBe(session);
     accepted.resolve({ id: 'saved', timestamp });
@@ -291,7 +351,7 @@ describe('document recovery', () => {
     expect(retained.doc.getText()).toContain('cache');
     expect(retained.doc.getText()).toContain('repair');
     expect(test.sessions.hasPending()).toBe(true);
-    expect(await test.open({ recover: true })).toBe(retained);
+    expect(await test.open()).toBe(retained);
     expect(persistence).toHaveBeenCalledOnce();
     expect(test.create).toHaveBeenCalledTimes(2);
     await test.sessions.dispose();
@@ -310,7 +370,7 @@ describe('document recovery', () => {
     const test = fixture(persistence);
     await expect(test.open({ recover: true })).rejects.toBe(failure);
     expect(test.sessions.get('page')!.doc.getText()).toBe('retained');
-    await test.open({ recover: true });
+    await test.open();
     expect(persistence).toHaveBeenCalledTimes(2);
     expect(test.create).toHaveBeenCalledOnce();
     expect(destroy).toHaveBeenCalledTimes(phase === 'sync' ? 1 : 0);
@@ -369,12 +429,26 @@ describe('document recovery', () => {
     expect(test.sessions.dispose()).toBe(disposal);
   });
 
+  it('does not replay a cleanup failure after close has retired the entry', async () => {
+    const failure = new Error('cache close failed');
+    const test = fixture(() => ({ whenSynced: Promise.resolve(), destroy: async () => { throw failure; } }));
+    const session = await test.open({ recover: true });
+    await expect(test.sessions.close('page')).rejects.toMatchObject({ errors: [failure] });
+    expect(test.sessions.get('page')).toBeUndefined();
+    expect(() => session.doc.getText()).toThrow('destroyed');
+    await expect(test.sessions.close('page')).resolves.toBeUndefined();
+    await test.sessions.dispose();
+  });
+
   it('includes a prior asynchronous discard in disposal', async () => {
     const cleaned = deferred<void>();
     const destroy = vi.fn(() => cleaned.promise);
-    const test = fixture(() => ({ whenSynced: Promise.resolve(), destroy }));
+    const clearData = vi.fn();
+    const test = fixture(() => ({ whenSynced: Promise.resolve(), destroy, clearData }));
     await test.open({ recover: true });
     const discarded = test.sessions.discard('page');
+    await test.sessions.discard('page', { clearPersistence: true });
+    expect(clearData).not.toHaveBeenCalled();
     const disposed = test.sessions.dispose();
     let settled = false;
     void disposed.then(() => { settled = true; });
@@ -402,6 +476,19 @@ describe('document recovery', () => {
 });
 
 describe('document authority and repair', () => {
+  it('rejects staged-only close until initialization or explicit discard', async () => {
+    const test = fixture();
+    const repair = update('repair').data;
+    test.sessions.stage('page', repair);
+    await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+    expect(test.sessions.get('page')).toBeUndefined();
+    expect(test.sessions.capturePending()).toEqual([{ key: 'page', update: repair }]);
+    await test.sessions.discard('page');
+    await test.sessions.close('page');
+    expect(test.sessions.hasPending()).toBe(false);
+    await test.sessions.dispose();
+  });
+
   it('stages only before opening and preserves the original repair through failed hydration', async () => {
     const test = fixture();
     const repair = update('repair').data;
@@ -492,22 +579,55 @@ describe('document authority and repair', () => {
     }
   });
 
+  it('allows close after a native parent-gone failure when the document has already been confirmed', async () => {
+    const test = fixture();
+    const failure = Object.assign(new Error('parent gone'), {
+      status: { code: 400, errorCode: PARENT_RECORD_NOT_FOUND_ERROR_CODE },
+    });
+    try {
+      const session = await test.open();
+      session.doc.insertText(0, 'confirmed');
+      test.create.mockImplementationOnce(async request => {
+        session.applyDurable(request.data, { recordId: 'confirmed', messageTimestamp: timestamp });
+        throw failure;
+      });
+      await expect(test.sessions.drain('page')).rejects.toBe(failure);
+      expect(test.onParentGone).toHaveBeenCalledExactlyOnceWith('page');
+      expect(test.sessions.hasPending()).toBe(false);
+      await test.sessions.close('page');
+      expect(test.sessions.get('page')).toBeUndefined();
+      expect(test.create).toHaveBeenCalledOnce();
+    } finally { await test.sessions.dispose(); }
+  });
 
-
-  it('returns a rejected open promise when demotion capture fails and still denies readonly writes', async () => {
+  it.each(['local', 'live'] as const)('retains a %s residual and readonly authority when demotion capture throws', async origin => {
     const test = fixture();
     try {
       const session = await test.open();
-      session.doc.insertText(0, 'retained local');
+      if (origin === 'local') session.doc.insertText(0, 'retained');
+      else session.doc.applyLive(update('retained').data);
       const failure = new Error('capture failed');
-      vi.spyOn(session.doc, 'planRepublish').mockImplementationOnce(() => { throw failure; });
+      const encode = vi.spyOn(session.doc, 'planRepublish').mockImplementationOnce(() => { throw failure; });
       let opening: ReturnType<typeof test.open> | undefined;
       expect(() => { opening = test.open({ writable: false }); }).not.toThrow();
       await expect(opening).rejects.toBe(failure);
       expect(test.sessions.get('page')).toBe(session);
-      expect(session.doc.getText()).toBe('retained local');
-      await expect(test.sessions.drain('page')).rejects.toThrow();
+      expect(session.doc.getText()).toBe('retained');
+      encode.mockImplementationOnce(() => { throw failure; });
+      expect(() => test.sessions.hasPending()).toThrow(failure);
+      encode.mockImplementationOnce(() => { throw failure; });
+      expect(() => test.sessions.capturePending()).toThrow(failure);
+      expect(test.sessions.hasPending()).toBe(true);
+      expect(frameText(test.sessions.capturePending()[0]!.update)).toBe('retained');
+      await expect(test.sessions.drain('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      await expect(test.sessions.close('page')).rejects.toBeInstanceOf(PendingDocumentChangesError);
+      await test.sessions.flush('page');
       expect(test.create).not.toHaveBeenCalled();
+      const create = vi.fn(async () => ({ id: 'fresh', timestamp }));
+      expect(await test.open({ create })).toBe(session);
+      await test.sessions.drainAll();
+      expect(create).toHaveBeenCalledOnce();
+      expect(test.sessions.hasPending()).toBe(false);
     } finally {
       await test.sessions.dispose();
     }
@@ -561,7 +681,6 @@ describe('document authority and repair', () => {
     if (barrier === 'pending close') expect(test.sessions.get('page')).toBeUndefined();
     await test.sessions.dispose();
   });
-
 
   it('retains cache recovery merged after a readonly rebind and never writes through readonly authority', async () => {
     const synced = deferred<void>();
@@ -778,7 +897,6 @@ describe('document authority and repair', () => {
       await test.sessions.dispose();
     }
   });
-
 
   it('rebinds durable snapshots through the existing convergence writer', async () => {
     vi.useFakeTimers();

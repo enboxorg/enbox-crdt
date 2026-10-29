@@ -95,7 +95,8 @@ export class DocumentWriterDisposedError extends Error {
 }
 
 type Binding = Pick<OpenDocumentSessionOptions, 'create' | 'writable' | 'canSquash'>;
-type CloseAttempt = { promise: Promise<void> };
+/** Retained close intent; a failed attempt clears only its in-flight promise. */
+type CloseRequest = { pending?: Promise<void> };
 type Entry<Document extends CollabDoc> = {
   key: string;
   abort: AbortController;
@@ -108,7 +109,7 @@ type Entry<Document extends CollabDoc> = {
   /** Local/cache edits or pending work retained when writable authority was lost. */
   retainResidual: boolean;
   tail: Promise<void>;
-  closing?: CloseAttempt;
+  closing?: CloseRequest;
   detachLocal?: () => void;
   recoveryRequested: boolean;
   persistencePending?: Promise<DocumentPersistence>;
@@ -146,12 +147,9 @@ export class DocumentSessions<Document extends CollabDoc> {
   constructor(private readonly options: DocumentSessionsOptions<Document>) {}
 
   /**
-   * Open or reclaim one document, rebinding future writes to the supplied authority.
-   * Concurrent calls share creation. Later recovery requests are honored even when
-   * hydration is pending. Omitting recover never detaches a requested adapter.
-   * For a valid request, authority changes take effect at invocation; queued setup uses the latest binding.
-   * Every failure rejects the returned promise, including synchronous preparation errors.
-   * A stopped writer rejects with DocumentWriterDisposedError and needs explicit recreation.
+   * Open or reclaim the canonical handle. Valid requests rebind authority immediately;
+   * hydration and requested recovery are serialized. All failures reject the promise.
+   * A stopped writer requires explicit recreation.
    */
   async open(key: string, options: OpenDocumentSessionOptions): Promise<DocumentSession<Document>> {
     if (this.disposal !== undefined) throw retiredError();
@@ -172,8 +170,10 @@ export class DocumentSessions<Document extends CollabDoc> {
     const owned = entry;
     const wasWritable = owned.binding.writable;
     owned.binding = binding;
-    if (wasWritable && !binding.writable && owned.writer?.capturePendingUpdate() !== undefined) {
+    if (wasWritable && !binding.writable) {
+      // Revocation is immediate; failed encoding must not make retained work look clean.
       owned.retainResidual = true;
+      if (owned.writer?.capturePendingUpdate() === undefined) owned.retainResidual = false;
     }
     const previousClose = owned.closing;
     owned.closing = undefined;
@@ -190,7 +190,7 @@ export class DocumentSessions<Document extends CollabDoc> {
         this.assertCurrent(owned);
         if (owned.recoveryRequested && !owned.recovered) {
           // Reclaim before waiting so an older close cannot destroy the recovered document.
-          await previousClose?.promise.catch(() => {});
+          await previousClose?.pending?.catch(() => {});
           await this.recover(owned);
         } else {
           owned.suspended = false;
@@ -228,7 +228,9 @@ export class DocumentSessions<Document extends CollabDoc> {
     const entry = this.entries.get(key);
     if (entry === undefined) return;
     await entry.tail;
-    if (this.isCurrent(entry) && entry.binding.writable && !entry.suspended) await entry.writer?.flush();
+    if (this.isCurrent(entry) && entry.initialized && entry.binding.writable && !entry.suspended) {
+      await entry.writer!.flush();
+    }
   }
 
   /** Strictly drain one writable document; staged read-only changes remain actionable. */
@@ -239,29 +241,35 @@ export class DocumentSessions<Document extends CollabDoc> {
   }
 
   /**
-   * Join opening work, drain and dispose. Unconfirmed read-only local/repair changes
-   * reject with PendingDocumentChangesError; incomplete recovery rejects with
-   * DocumentNotReadyError. A stopped writer with pending work rejects with
-   * DocumentWriterDisposedError. Failures before retirement retain the exact handle for
-   * retry; adapter cleanup can reject after ownership is already fenced. An
-   * intervening open reclaims the handle and fences this close's finalizer.
+   * Join setup and strictly drain before retirement. Failed attempts retain the handle
+   * for retry; an intervening open reclaims it. Staged-only keys reject until opened
+   * or discarded. Adapter cleanup can reject after ownership is already fenced.
    */
   close(key: string): Promise<void> {
     const entry = this.entries.get(key);
-    if (entry === undefined) return Promise.resolve();
-    if (entry.closing !== undefined) return entry.closing.promise;
-    const attempt: CloseAttempt = { promise: entry.tail.then(async () => {
-      if (!this.isCurrent(entry) || entry.closing !== attempt) return;
+    if (entry === undefined) {
+      const result = this.staged.has(key)
+        ? Promise.reject(new PendingDocumentChangesError()) : Promise.resolve();
+      void result.catch(() => {});
+      return result;
+    }
+    if (entry.closing?.pending !== undefined) return entry.closing.pending;
+    const request: CloseRequest = {};
+    const pending = entry.tail.then(async () => {
+      if (!this.isCurrent(entry) || entry.closing !== request) return;
       this.assertDrainReady(entry);
       this.emit(entry, 'closing');
-      if (!this.isCurrent(entry) || entry.closing !== attempt) return;
+      if (!this.isCurrent(entry) || entry.closing !== request) return;
       await this.drainReady(entry);
-      if (entry.closing === attempt && this.isCurrent(entry)) await this.remove(entry, false);
-    }) };
-    entry.closing = attempt;
-    // Retain failures without leaking a rejection when a host closes in the background.
-    void attempt.promise.catch(() => {});
-    return attempt.promise;
+      if (entry.closing === request && this.isCurrent(entry)) await this.remove(entry, false);
+    });
+    request.pending = pending;
+    entry.closing = request;
+    // Keep the close intent for reclaim/drainAll, but allow another close after failure.
+    void pending.catch(() => {
+      if (this.isCurrent(entry) && entry.closing === request) request.pending = undefined;
+    });
+    return pending;
   }
 
   /** Drain every retained document, finishing successful outstanding closes. */
@@ -276,7 +284,10 @@ export class DocumentSessions<Document extends CollabDoc> {
     if (this.staged.size > 0) throw new PendingDocumentChangesError();
   }
 
-  /** Fence immediately and abandon this document; cache deletion is explicit. */
+  /**
+   * Fence and abandon the managed document. Choose cache deletion on this first
+   * retirement call; later calls cannot change an already-retired adapter's policy.
+   */
   discard(key: string, options: { clearPersistence?: boolean } = {}): Promise<void> {
     this.staged.delete(key);
     const entry = this.entries.get(key);
@@ -296,14 +307,14 @@ export class DocumentSessions<Document extends CollabDoc> {
 
   /**
    * Copy whole writable/local residuals and staged repairs, including stopped writers.
-   * Encoding failures throw without discarding retained edits.
+   * Encoding failures propagate without discarding retained edits.
    */
   capturePending(): Array<{ key: string; update: Uint8Array }> {
     const pending = new Map(this.staged);
     for (const entry of this.entries.values()) {
       // A staged frame remains separate until initial hydration applies it successfully.
       if (pending.has(entry.key)) continue;
-      const update = this.inspectPending(entry);
+      const update = this.readPending(entry);
       if (update !== undefined) pending.set(entry.key, update);
     }
     return [...pending].map(([key, update]) => ({ key, update: Uint8Array.from(update) }));
@@ -325,11 +336,11 @@ export class DocumentSessions<Document extends CollabDoc> {
     this.staged.set(key, copy);
   }
 
-  /** Whether writable/local or staged state remains beyond known durable storage. */
+  /** Check retained write obligations; encoding failures propagate rather than report false. */
   hasPending(): boolean {
     if (this.staged.size > 0) return true;
     for (const entry of this.entries.values()) {
-      if (this.inspectPending(entry) !== undefined) return true;
+      if (this.readPending(entry) !== undefined) return true;
     }
     return false;
   }
@@ -427,8 +438,8 @@ export class DocumentSessions<Document extends CollabDoc> {
     if (!result.applied) throw new Error(`Unable to apply durable document update: ${result.reason}`);
   }
 
-  /** Inspect an eligible residual once and forget confirmed retention markers. */
-  private inspectPending(entry: Entry<Document>): Uint8Array | undefined {
+  /** Read an eligible residual and clear its retention marker only when confirmed saved. */
+  private readPending(entry: Entry<Document>): Uint8Array | undefined {
     if (!this.isCurrent(entry) || !entry.initialized || (!entry.binding.writable && !entry.retainResidual)) return;
     const pending = entry.writer!.capturePendingUpdate();
     if (pending === undefined) entry.retainResidual = false;
@@ -455,7 +466,7 @@ export class DocumentSessions<Document extends CollabDoc> {
     if (entry.binding.writable && !entry.writer!.isDisposed) await entry.writer!.drain();
     if (!this.isCurrent(entry)) return;
     this.assertDrainReady(entry);
-    const pending = this.inspectPending(entry);
+    const pending = this.readPending(entry);
     if (!entry.binding.writable && pending !== undefined) {
       throw new PendingDocumentChangesError();
     }
@@ -463,7 +474,7 @@ export class DocumentSessions<Document extends CollabDoc> {
 
   private assertDrainReady(entry: Entry<Document>): void {
     if (entry.writer?.isDisposed) {
-      if (entry.suspended || this.inspectPending(entry) !== undefined) throw new DocumentWriterDisposedError();
+      if (entry.suspended || this.readPending(entry) !== undefined) throw new DocumentWriterDisposedError();
     }
     if (!entry.initialized || entry.suspended) throw new DocumentNotReadyError();
   }

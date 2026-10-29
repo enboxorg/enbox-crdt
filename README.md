@@ -98,7 +98,8 @@ An adapter is attached once per document. Opening waits for `whenSynced`
 and, when writable, a strict durability drain before enabling autosave. A later
 recovery request suspends autosave while cached updates merge. Attachment failures
 retry the same configured factory; failed recovery writes retain the document
-and synced adapter. Omitting `recover` later does not detach it, and requesting
+and synced adapter. Once requested, recovery remains required: a later `open`
+retries failed recovery even when `recover` is omitted or false. Requesting
 recovery without a configured factory rejects. Persistence adapters must provide
 idempotent `destroy` and, when supported, `clearData`;
 the shipped IndexedDB adapter already provides this contract.
@@ -109,15 +110,20 @@ Those unconfirmed cache changes use the local-update feed: writable sessions
 schedule a save and read-only sessions retain them for repair. Network transports
 must use `doc.applyLive` or `session.applyDurable` to preserve their distinct origins.
 
-`close` joins hydration and drains before disposing. A failed drain rejects and
-retains the handle; reopen reclaims it, so an older close cannot destroy a newly
-claimed document. `get` and `values` include retained closing documents but hide
-incomplete hydration. `flush(key)` is best effort; `drain(key)` and `drainAll()`
-are strict barriers. Ordinary native operations already issued before an
-authority change keep their outcomes; future writes use the current target.
-Rebinding changes that target immediately, including while an older open is
-waiting. Hydration and recovery setup are serialized; discard cancels them
-immediately, and an older close cannot dispose a newly reclaimed handle.
+`close` joins hydration and drains before disposing. Concurrent calls share the
+current attempt. A failed attempt retains the handle and can be retried with
+another `close` after its cause resolves. Reopening instead reclaims the handle;
+`drainAll()` can finish retained close requests. An older attempt cannot dispose
+a reclaimed document or cancel a newer close. Staged-only keys reject close
+until they are opened or explicitly discarded. A key with neither a handle nor
+a staged repair closes without work, including after an earlier cleanup failed.
+
+`get` and `values` hide incomplete hydration but include retained closing handles.
+`flush(key)` is best effort; `drain(key)` and `drainAll()` are strict barriers.
+Hydration and recovery setup are serialized. Rebinding and discard take effect
+immediately, including while earlier setup waits. Already-issued native writes
+keep their outcomes; future writes use the latest target. Failed encoding during
+demotion does not restore obsolete write authority or erase retained work.
 
 `capturePending()` copies writable/local residuals for authority repair, including
 read-only edits made during pending or failed recovery. One local-update listener
@@ -127,18 +133,19 @@ reject staging. The whole frame is validated with a temporary bare document, so
 malformed bytes cannot replace a valid repair. Initial hydration applies the
 repair before exposing the handle, then consumes the staged frame even for
 read-only access; the document retains its unconfirmed changes. Recovery captures
-the whole state beyond the durable shadow, not only this client's operations: peer live edits
-can ride along once a document has local changes or a staged repair. Demotion
-also retains the former writable document's residual, even if it contains only
-peer live edits. This preserves the existing healing policy.
+the whole state beyond the durable shadow, not only this client's operations:
+peer live edits can ride along once there are local changes or a staged repair.
+Demotion also retains the former writable document's residual, even if it contains
+only peer live edits. This preserves the existing healing policy.
 
 The factory must create a fresh empty in-memory document. If initial hydration
 or repair application fails, `open` rejects, destroys the incomplete document,
 and keeps the original staged frame for a fresh attempt. Later persistence
 failures retain the hydrated document and its changes. All `open` failures reject
-its returned promise. Encoding can make `capturePending()` throw without
-discarding retained edits. An unapplied staged repair remains pending until
-successful initialization or explicit discard.
+its returned promise. `hasPending()`, capture, and lifecycle barriers may inspect
+or encode document state; encoding failures propagate rather than report a clean
+document, and do not discard retained edits. An unapplied staged repair remains
+pending until successful initialization or explicit discard.
 
 `writable: false` controls native write dispatch; it does not make the exposed
 `CollabDoc` immutable. If application code edits that document, its local-update
@@ -165,9 +172,12 @@ intentionally retire a deleted page should explicitly discard its session from
 `discard(key)` and `dispose()` explicitly abandon owned state: they fence handles
 and stop scheduling immediately, then await adapter cleanup. Cache data is kept
 unless `discard(key, { clearPersistence: true })` requests its deletion through
-the adapter. Call `drainAll()` before `dispose()` when shutdown must preserve
-pending changes. Lifecycle notifications report `opened` (new or reclaimed),
-`closing` (a close attempt, which may reject while retaining the handle), and
+the managed adapter. Choose that policy on the first discard, before retirement.
+A later discard cannot upgrade an in-flight cleanup or delete a detached cache;
+after close, use the host's cache policy to clear stored data. Await the original
+operation for its cleanup result. Call `drainAll()` before `dispose()` when shutdown
+must preserve pending changes. Lifecycle notifications report `opened` (new or
+reclaimed), `closing` (a close attempt, which may reject while retaining the handle), and
 `disposed` (ownership fenced and the document destroyed). These are notifications,
 not a complete state machine. Await the operation's promise for asynchronous
 adapter cleanup; `disposed` can arrive before that cleanup settles. After a
