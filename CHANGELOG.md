@@ -1,5 +1,13 @@
 # @enbox/crdt
 
+## 0.3.1
+
+### Patch Changes
+
+- [#14](https://github.com/enboxorg/enbox-crdt/pull/14) [`d2d4f7b`](https://github.com/enboxorg/enbox-crdt/commit/d2d4f7b845536951699aa25071de52358b35f38c) Thanks [@LiranCohen](https://github.com/LiranCohen)! - Recognize the DWN SDK's ModuleAuthorization error codes so squash backstops
+  republish retained edits and missing parents stop durable writers. Update DWN
+  module-path terminology in the integration documentation.
+
 ## 0.3.0
 
 ### Minor Changes
