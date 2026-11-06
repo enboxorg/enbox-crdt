@@ -249,8 +249,8 @@ doc.destroy();
 
 The callback returns the native record's `id` and `timestamp`, or throws its
 original error. The writer supplies `squash` and matching timestamp fields;
-protocol paths, parent contexts, and any wire-format conversion stay in the
-binding. Application timing values can change with `setTimers()`, and updated
+module paths (`modulePath`), parent contexts, and wire-format conversion stay
+in the binding. Application timing values can change with `setTimers()`, and updated
 squash authority with `setCanSquash()`.
 
 A backstop can reveal a newer squash before its contents arrive. The document

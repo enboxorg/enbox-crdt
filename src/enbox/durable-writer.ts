@@ -44,7 +44,7 @@ const REAL_CLOCK: DurableWriterClock = {
 /** Bind one document to native writes without starting a write or owning the document's lifetime. */
 export interface DurableWriterOptions {
   doc: PersistenceDocument;
-  /** Bind the protocol path, parent, and optional wire-format conversion here. Return the native record or throw. */
+  /** Bind the modulePath, parent, and optional wire-format conversion here. Return the native record or throw. */
   create(request: DurableWriteRequest): Promise<DurableWriteRecord>;
   timers: DurableWriterTimers;
   canSquash?: boolean;
