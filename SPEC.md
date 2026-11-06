@@ -34,8 +34,8 @@ does two things:
    protocol redesign.
 
 Out of scope for v1: awareness/presence payloads, key management, transport
-framing, and storage protocol rules (record paths, `$squash`, roles) — those
-belong to each dapp's DWN protocol definition. Appendix A recommends a record
+framing, and DWN storage rules (record paths, `$squash`, roles) — those
+belong to each dapp's DWN module definition. Appendix A recommends a record
 shape.
 
 ## 2. The delta envelope
@@ -168,7 +168,7 @@ reference test suite.
 
 ## Appendix A — Recommended DWN record shape (informative)
 
-For a dapp protocol storing enveloped deltas, the notesd-proven shape:
+For a dapp module storing enveloped deltas, the notesd-proven shape:
 
 - delta records: `dataFormat: application/octet-stream`, schemaless,
   `encryptionRequired`, `$immutable`, `$size` bounded (2 MiB works well),

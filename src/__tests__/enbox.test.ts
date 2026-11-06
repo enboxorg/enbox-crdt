@@ -3,25 +3,23 @@ import * as Y from 'yjs';
 
 import {
   addMicrosecondTick,
-  BACKSTOP_ERROR_CODE,
   classifyWriteResult,
   computeRepublish,
   formatDwnTimestamp,
-  PARENT_GONE_ERROR_CODE,
-  PARENT_RECORD_NOT_FOUND_ERROR_CODE,
   squashFloorTimestamp,
 } from '../enbox/index.js';
 import { decodeEnvelope } from '../envelope.js';
 import { yjs1 } from '../yjs1/advanced.js';
 
 describe('classifyWriteResult', () => {
-  it('maps status codes to write classes on errorCode, never prose', () => {
+  it('classifies literal SDK module authorization codes with their required HTTP status', () => {
     expect(classifyWriteResult({ code: 202 })).toBe('ok');
-    expect(classifyWriteResult({ code: 409, errorCode: BACKSTOP_ERROR_CODE })).toBe('backstop');
-    expect(classifyWriteResult({ code: 400, errorCode: PARENT_GONE_ERROR_CODE })).toBe('parent-gone');
-    expect(classifyWriteResult({ code: 400, errorCode: PARENT_RECORD_NOT_FOUND_ERROR_CODE })).toBe('parent-gone');
+    expect(classifyWriteResult({ code: 409, errorCode: 'ModuleAuthorizationSquashBackstop' })).toBe('backstop');
+    expect(classifyWriteResult({ code: 400, errorCode: 'ModuleAuthorizationParentNotFoundConstructingRecordChain' })).toBe('parent-gone');
+    expect(classifyWriteResult({ code: 400, errorCode: 'ModuleAuthorizationParentRecordNotFound' })).toBe('parent-gone');
     expect(classifyWriteResult({ code: 409, errorCode: 'SomethingElse' })).toBe('error');
-    expect(classifyWriteResult({ code: 400, errorCode: BACKSTOP_ERROR_CODE })).toBe('error');
+    expect(classifyWriteResult({ code: 400, errorCode: 'ModuleAuthorizationSquashBackstop' })).toBe('error');
+    expect(classifyWriteResult({ code: 409, errorCode: 'ModuleAuthorizationParentRecordNotFound' })).toBe('error');
     expect(classifyWriteResult({ code: 500 })).toBe('error');
   });
 
@@ -35,7 +33,7 @@ describe('classifyWriteResult', () => {
     const wrapped = {
       status: {
         code: 409,
-        errorCode: BACKSTOP_ERROR_CODE,
+        errorCode: 'ModuleAuthorizationSquashBackstop',
         info: { squashFloorTimestamp: '2026-08-10T00:00:00.000000Z' },
       },
     };

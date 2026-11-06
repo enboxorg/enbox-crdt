@@ -96,12 +96,12 @@ function okResult(): DurableWriteRecord {
 }
 function backstop(floor = '2026-02-02T00:00:00.000000Z'): Error {
   return Object.assign(new Error('Squash backstop'), { status: {
-    code: 409, errorCode: 'ProtocolAuthorizationSquashBackstop', info: { squashFloorTimestamp: floor },
+    code: 409, errorCode: 'ModuleAuthorizationSquashBackstop', info: { squashFloorTimestamp: floor },
   } });
 }
-function pageGone(): Error {
+function pageGone(errorCode = 'ModuleAuthorizationParentRecordNotFound'): Error {
   return Object.assign(new Error('Parent gone'), { status: {
-    code: 400, errorCode: 'ProtocolAuthorizationParentRecordNotFound',
+    code: 400, errorCode,
   } });
 }
 function transient(): Error {
@@ -379,8 +379,11 @@ describe('DurableWriter — squash backstop (KTD-2/3)', () => {
 // ---------------------------------------------------------------------------
 
 describe('DurableWriter — page-gone teardown (KTD-2)', () => {
-  it('invokes teardown once, cancels timers, and no-ops afterward', async () => {
-    const h = makeLoop({ writeImpl: () => pageGone() });
+  it.each([
+    'ModuleAuthorizationParentRecordNotFound',
+    'ModuleAuthorizationParentNotFoundConstructingRecordChain',
+  ])('stops the writer once without retrying after %s', async errorCode => {
+    const h = makeLoop({ writeImpl: () => pageGone(errorCode) });
     type(h.doc, 'edit');
     await h.loop.flush();
     await Promise.resolve();
@@ -958,7 +961,7 @@ describe('DurableWriter — notification isolation', () => {
 describe('DurableWriter — unusable backstop metadata', () => {
   it.each([undefined, 'not-a-timestamp'])('keeps an unusable floor %s actionable even when an obsolete echo looked converged', async floor => {
     const failure = Object.assign(new Error('Backstop without floor'), {
-      status: { code: 409, errorCode: 'ProtocolAuthorizationSquashBackstop', ...(floor === undefined ? {} : { info: { squashFloorTimestamp: floor } }) },
+      status: { code: 409, errorCode: 'ModuleAuthorizationSquashBackstop', ...(floor === undefined ? {} : { info: { squashFloorTimestamp: floor } }) },
     });
     const base = createYjs1Doc();
     base.insertText(0, 'old');

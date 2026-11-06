@@ -39,17 +39,17 @@ export type DeltaWriteStatusInput = DeltaWriteStatus | DeltaWriteStatusCarrier;
 export type WriteClass = 'ok' | 'backstop' | 'parent-gone' | 'error';
 
 /** The `DwnErrorCode` of a squash temporal-backstop rejection. */
-export const BACKSTOP_ERROR_CODE = 'ProtocolAuthorizationSquashBackstop';
+export const BACKSTOP_ERROR_CODE = 'ModuleAuthorizationSquashBackstop';
 
 /**
  * The `DwnErrorCode` of the terminal parent-gone rejection: a delta whose
  * parent record was pruned fails referential integrity (HTTP 400). Terminal —
  * never re-publish; tear the document session down.
  */
-export const PARENT_GONE_ERROR_CODE = 'ProtocolAuthorizationParentNotFoundConstructingRecordChain';
+export const PARENT_GONE_ERROR_CODE = 'ModuleAuthorizationParentNotFoundConstructingRecordChain';
 
 /** The immediate-parent variant of the terminal parent-gone rejection. */
-export const PARENT_RECORD_NOT_FOUND_ERROR_CODE = 'ProtocolAuthorizationParentRecordNotFound';
+export const PARENT_RECORD_NOT_FOUND_ERROR_CODE = 'ModuleAuthorizationParentRecordNotFound';
 
 /**
  * Classify a delta write status. Pure.
